@@ -1,0 +1,17 @@
+Test project /Users/k0959535/Dropbox/Programming/2026 WolfNum/build
+    Start  2: version_cpu
+1/6 Test  #2: version_cpu ......................   Passed    0.68 sec
+    Start  4: package_version_cpu
+2/6 Test  #4: package_version_cpu ..............   Passed   11.74 sec
+    Start 10: linalg_cpu
+3/6 Test #10: linalg_cpu .......................   Passed    1.48 sec
+    Start 11: linalg_gpu
+4/6 Test #11: linalg_gpu .......................   Passed   33.53 sec
+    Start 13: linalg_qr
+5/6 Test #13: linalg_qr ........................   Passed   94.82 sec
+    Start 27: resident_linalg_gpu
+6/6 Test #27: resident_linalg_gpu ..............   Passed   12.32 sec
+
+100% tests passed out of 6
+
+Total Test time (real) = 154.58 sec

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Add `Linalg::gemm_gpu`: exact synchronous GEMM that rejects data-dependent
+  host products before modifying C or submitting commands. Existing GEMM defaults
+  remain unchanged. Extend the strong-coupling adapter with measured exponent-band
+  limits, bounded row tiles, placement counters and `SC_GPU_REQUIRE_GEMM`.
+  Production-sized g100/P640/Q540 reconstruction replay at 1152 bits confirms
+  15,153,240 and 12,789,240 GPU outputs with zero host products, with 80 sampled
+  MPFR component checks. GEMM calls took 25.727/16.030 s under concurrent CPU
+  load; full-solver timing is not inferred. Strict API checks at 512/928/1024/1152/1536/2048
+  pass normally and under Metal validation, including rejection before writing C.
+  Focused CPU/GPU GEMM, resident GEMM, real QR and version/package tests pass;
+  complex QR checks 528 factorizations/solves and 1056 Q applications against MPFR.
+
 - Extend storage, bridges, arithmetic, dense/batched GEMM and real/complex QR
   from 1024 to 2048 bits at every 32-bit step. Wide Metal arithmetic uses rolled
   loops; exact host products and private batched/cast scratch accommodate the

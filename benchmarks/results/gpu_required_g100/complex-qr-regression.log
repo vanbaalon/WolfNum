@@ -1,0 +1,9 @@
+Apple M5 Max
+complex qr 224 bits: match the MPFR replay
+complex qr 256 bits: match the MPFR replay
+complex qr 64, 384 bits: match the MPFR replay
+QSC-like complex 400x200 at 224 bits: match the MPFR replay
+QSC-like complex 400x200 at 256 bits: match the MPFR replay
+16 real-input factorizations bit-identical to Linalg::factor_qr
+300 pivoted factorizations (124 rank-deficient, 338 recomputed norms; 40 equal to the unpivoted replay of A P) bit-identical to the pivoted reference
+528 factorizations (240 rank-deficient; 1804 GPU and 320 host block updates), 528 solves and 1056 Q applications bit-identical to the reference

@@ -1,0 +1,7 @@
+2026-10-11 18:35:14.658 test_wolfnum_gpu_required[24480:172042389] Metal GPU Validation Enabled
+512 bits: strict GPU products/updates/transpose match MPFR; fallback rejected before writing C
+928 bits: strict GPU products/updates/transpose match MPFR; fallback rejected before writing C
+1024 bits: strict GPU products/updates/transpose match MPFR; fallback rejected before writing C
+1152 bits: strict GPU products/updates/transpose match MPFR; fallback rejected before writing C
+1536 bits: strict GPU products/updates/transpose match MPFR; fallback rejected before writing C
+2048 bits: strict GPU products/updates/transpose match MPFR; fallback rejected before writing C

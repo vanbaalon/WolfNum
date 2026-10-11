@@ -3,3 +3,4 @@ benchmarks/results/section9_exact_gemm4_comparison_cpu_gate/empty_paths.txt whit
 
 # Unified diffs prefix empty context lines with a space.
 docs/strong-coupling-client.patch whitespace=-blank-at-eol
+docs/strong-coupling-gpu-required.patch whitespace=-blank-at-eol

@@ -238,7 +238,7 @@ struct Linalg::Impl {
     Kernels& get(int bits){return cache->get(bits);}
     const std::vector<std::uint32_t>& bounds(Kernels& k,int L,int Wc){return cache->bounds(k,L,Wc);}
     // C[i*stride + j] (stride 0: Nc) = RN(dot), or RN(C - dot) with sub. Views and C inside a resident buffer are used in place.
-    Timing run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,std::size_t K,void* C,bool syrk,bool lower_only,bool sub=false,std::size_t stride=0);
+    Timing run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,std::size_t K,void* C,bool syrk,bool lower_only,bool sub=false,std::size_t stride=0,bool require_gpu=false);
     template<int N> CholeskyInfo cholesky_n(const Number<N>* A,std::size_t n,Number<N>* L,const FactorOptions& fo);
     template<int N> Timing solve_n(const Number<N>* L,std::size_t n,const Number<N>* B,std::size_t nrhs,Number<N>* X,const FactorOptions& fo,int passes,bool upper=false);
     // Householder QR (qr_n), one compact-WY block applied to columns [c0, c1) of X (qr_block), Q or Q^T applied to C (qr_apply_n).
@@ -302,7 +302,12 @@ Timing Linalg::gemm(int bits,bool transpose_a,const void* A,const void* B,std::s
     View lv=transpose_a?View{static_cast<const unsigned char*>(A),e,1,m,bits/32}:View{static_cast<const unsigned char*>(A),e,k,1,bits/32};
     return impl->run(bits,lv,{static_cast<const unsigned char*>(B),e,1,n,bits/32},m,n,k,C,false,false,subtract);
 }
-Timing Linalg::Impl::run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,std::size_t K,void* C,bool syrk,bool lower_only,bool sub,std::size_t stride){@autoreleasepool{
+Timing Linalg::gemm_gpu(int bits,bool transpose_a,const void* A,const void* B,std::size_t m,std::size_t n,std::size_t k,void* C,bool subtract){
+    check_bits(bits);std::size_t e=bits/8+12;
+    View lv=transpose_a?View{static_cast<const unsigned char*>(A),e,1,m,bits/32}:View{static_cast<const unsigned char*>(A),e,k,1,bits/32};
+    return impl->run(bits,lv,{static_cast<const unsigned char*>(B),e,1,n,bits/32},m,n,k,C,false,false,subtract,0,true);
+}
+Timing Linalg::Impl::run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,std::size_t K,void* C,bool syrk,bool lower_only,bool sub,std::size_t stride,bool require_gpu){@autoreleasepool{
     auto start=Clock::now();report=LinalgReport{};report.m=M;report.n=Nc;report.k=K;if(!stride)stride=Nc;pool_workers();
     const std::size_t limit=std::size_t(1)<<31;if(M>=limit||Nc>=limit||K>=limit||M*stride>=limit)throw std::invalid_argument("matrix dimensions exceed 32-bit indexing");
     if(M&&Nc&&!C)throw std::invalid_argument("null output");if(M*Nc&&K&&(!lv.base||!rv.base))throw std::invalid_argument("null input");
@@ -312,6 +317,12 @@ Timing Linalg::Impl::run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,s
     const Side& rs=syrk?ls:rs_own;
     report.left_bands=ls.histogram;report.right_bands=rs.histogram;report.left_fallback=ls.fallback;report.right_fallback=rs.fallback;
     report.analysis_seconds=since(t);
+    const std::size_t host_outputs=ls.fallback*(rs.single+rs.multi+rs.fallback)+(ls.single+ls.multi)*rs.fallback;
+    if(require_gpu&&host_outputs){
+        throw std::runtime_error("WolfNum GPU-required GEMM: "+std::to_string(host_outputs)+" outputs would use host fallback; left/right fallback lines="+
+            std::to_string(ls.fallback)+"/"+std::to_string(rs.fallback)+", max_bands="+std::to_string(options.max_bands)+", max_spread="+std::to_string(options.max_spread)+
+            (force?" (forced fallback or K exceeds 65472)":" (exponent-band limits)"));
+    }
     Timing timing{0,0};id<MTLBuffer> out=nil;std::size_t out_offset=0;
     if(!ls.band.empty()&&!rs.band.empty()){
         Kernels& kern=get(bits);t=Clock::now();

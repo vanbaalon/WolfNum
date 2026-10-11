@@ -1,0 +1,18 @@
+{
+  "date": "2026-10-11",
+  "base_commit": "e04720d58fec68a297d188106617c293724b725c",
+  "case": {
+    "g": 100,
+    "nP": 640,
+    "nQ": 540,
+    "WP": 270,
+    "input_bits": 1128,
+    "gpu_bits": 1152,
+    "alphaP": 2.0,
+    "alphaQ": 2.2
+  },
+  "basis_sha256": "c5cf0d056f7e51da3133f40d093803c4b0c788c16ce4621e6454e4aa3879d7ff",
+  "basis_bytes": 742592,
+  "basis_format": "four OrthoPoly records: native uint64 count, packed Complex<36> mu0, count packed Complex<36> b values; little-endian arm64",
+  "scope": "Full reconstruction GEMMs only; 80 exact MPFR sample component checks, zero host products. Concurrent CPU solver jobs were active; timings are diagnostic, not an idle CPU/GPU benchmark or a full Newton solve."
+}

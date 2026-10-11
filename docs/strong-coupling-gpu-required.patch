@@ -1,0 +1,165 @@
+--- a/cpp/include/sc_gpu.hpp
++++ b/cpp/include/sc_gpu.hpp
+@@ -7,6 +7,7 @@
+ #include "refio.hpp"
+ #include <atomic>
+ #include <chrono>
++#include <climits>
+ #include <mutex>
+ 
+ #ifdef SC_LIMBFORGE
+@@ -25,6 +26,7 @@
+ using Mat = std::vector<Vec>;
+ inline bool enabled() { static const bool e = [] { const char* v = std::getenv("SC_GPU"); return v && std::atoi(v) != 0; }(); return e; }
+ inline bool profile() { static const bool e = std::getenv("SC_GPU_PROFILE") != nullptr; return e; }
++inline bool require_gemm() { const char* e = std::getenv("SC_GPU_REQUIRE_GEMM"); return e && std::atoi(e) != 0; }
+ inline long long nowns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+ #ifdef SC_LIMBFORGE
+ inline limbforge::Engine& engine() { static limbforge::Engine e = [] { limbforge::check_library_version(); return limbforge::Engine(); }(); return e; }
+@@ -51,6 +53,69 @@
+ #define SC_LF_WIDTHS(X) X(64) X(96) X(128) X(160) X(192) X(224) X(256) X(288) X(320) X(352) X(384) X(416) X(448) X(480) X(512) X(544) X(576) X(608) X(640) X(672) X(704) X(736) X(768) X(800) X(832) X(864) X(896) X(928) X(960) X(992) X(1024) SC_LF_WIDE_WIDTHS(X)
+ #endif
+ 
++#ifdef LIMBFORGE_GPU_REQUIRED_GEMM_API
++// Metadata only: no binary64 conversion. Both embedded A rows contain the same real/imaginary components.
++inline int dense_spread(const Vec& A, size_t m, size_t k, const Vec& B, size_t n) {
++  long largest = 0;
++  auto line = [&](const Vec& values, size_t offset, size_t stride, size_t count) {
++    long lo = LONG_MAX, hi = LONG_MIN;
++    for (size_t q = 0; q < count; ++q) { const C& z = values[offset + q * stride];
++      for (auto v : {mpc_realref(z.v), mpc_imagref(z.v)}) {
++        if (!mpfr_number_p(v)) throw std::runtime_error("GEMM: nonfinite input");
++        if (!mpfr_zero_p(v)) { long e = mpfr_get_exp(v); lo = std::min(lo, e); hi = std::max(hi, e); }
++      }
++    }
++    if (hi != LONG_MIN) largest = std::max(largest, hi - lo);
++  };
++  for (size_t i = 0; i < m; ++i) line(A, i * k, 1, k);
++  for (size_t j = 0; j < n; ++j) line(B, j, n, k);
++  if (largest > 8190) throw std::runtime_error("GPU GEMM: exponent spread exceeds 8192-bit workspace limit");
++  return int((largest + 2 + 63) / 64 * 64); // two bits cover a possible import rounding carry
++}
++inline limbforge::Linalg& dense_la(int spread, int threads) {
++  static thread_local std::map<std::pair<int,int>, std::unique_ptr<limbforge::Linalg>> cache;
++  auto key = std::make_pair(spread, std::max(1, threads)); auto& item = cache[key];
++  if (!item) { limbforge::LinalgOptions options; options.band_bits = 512;
++    options.max_spread = spread; options.max_bands = 1 + spread / 513; options.host_threads = key.second;
++    item = std::make_unique<limbforge::Linalg>(engine(), options);
++  }
++  return *item;
++}
++template <int B> bool cgemm_t(const Vec& A, size_t m, size_t k, const Vec& Bm, size_t n, Vec& Cm, int thr) {
++  try {
++    using F = limbforge::Float<B>; const long long t0 = nowns();
++    if (!m || !n || !k) { Cm.assign(m * n, C()); return true; }
++    const size_t tile = 128; // bound residues, accumulators and packed inputs independently of the full row count
++    const auto support = limbforge::query_gemm_support(engine().device_limits(), B, 2 * std::min(m,tile), n, 2 * k);
++    if (!support.supported) throw std::runtime_error("GEMM preflight: " + support.reason);
++    const int spread = dense_spread(A,m,k,Bm,n); auto& dense = dense_la(spread,thr);
++    std::vector<F> Br(2*k*n);
++    safe_par_for((int)k,thr,[&](int q){for(size_t j=0;j<n;++j){const C& z=Bm[size_t(q)*n+j];
++      Br[(2*q)*n+j]=limbforge::from_mpfr<B>(mpc_realref(z.v));Br[(2*q+1)*n+j]=limbforge::from_mpfr<B>(mpc_imagref(z.v));}});
++    Cm.assign(m*n,C()); double device=0,wall=0,pack=(nowns()-t0)*1e-9,unpack=0;
++    size_t gpu=0,host=0,trivial=0,tiles=0;
++    for(size_t first=0;first<m;first+=tile){const size_t rows=std::min(tile,m-first);long long tp=nowns();
++      std::vector<F> Ar(4*rows*k),Cr(2*rows*n);
++      safe_par_for((int)rows,thr,[&](int i){for(size_t q=0;q<k;++q){const C& z=A[(first+size_t(i))*k+q];
++        F re=limbforge::from_mpfr<B>(mpc_realref(z.v)),im=limbforge::from_mpfr<B>(mpc_imagref(z.v));
++        Ar[(2*i)*2*k+2*q]=re;Ar[(2*i)*2*k+2*q+1]=limbforge::negate(im);
++        Ar[(2*i+1)*2*k+2*q]=im;Ar[(2*i+1)*2*k+2*q+1]=re;}});
++      pack+=(nowns()-tp)*1e-9;
++      auto timing=dense.gemm_gpu(B,false,Ar.data(),Br.data(),2*rows,n,2*k,Cr.data());
++      const auto& report=dense.report();device+=timing.gpu_seconds;wall+=timing.wall_seconds;
++      gpu+=report.gpu_outputs;host+=report.fallback_outputs;trivial+=report.trivial_outputs;++tiles;
++      if(report.fallback_outputs || report.gpu_outputs+report.trivial_outputs!=2*rows*n)
++        throw std::runtime_error("GPU-required GEMM placement counter mismatch");
++      tp=nowns();safe_par_for((int)rows,thr,[&](int i){for(size_t j=0;j<n;++j){
++        if(Cr[(2*i)*n+j].status || Cr[(2*i+1)*n+j].status) throw std::runtime_error("GEMM: arithmetic status");
++        C& z=Cm[(first+size_t(i))*n+j];limbforge::to_mpfr<B>(mpc_realref(z.v),Cr[(2*i)*n+j]);limbforge::to_mpfr<B>(mpc_imagref(z.v),Cr[(2*i+1)*n+j]);}});
++      unpack+=(nowns()-tp)*1e-9;
++    }
++    if(profile() || require_gemm()) std::fprintf(stderr,"  [WolfNum] cgemm %zu x %zu x %zu (%d bits): pack %.3f s, gemm %.3f s (device %.3f s), unpack %.3f s; GPU outputs=%zu, host fallback=%zu, trivial=%zu, tiles=%zu, spread limit=%d\n",m,k,n,B,pack,wall,device,unpack,gpu,host,trivial,tiles,spread);
++    return true;
++  } catch(const std::exception& e){if(require_gemm()) throw;warn("cgemm",e);return false;}
++}
++#else
+ template <int B> bool cgemm_t(const Vec& A, size_t m, size_t k, const Vec& Bm, size_t n, Vec& Cm, int thr) {
+   try {
+     using F = limbforge::Float<B>; const long long t0 = nowns();
+@@ -75,6 +140,7 @@
+     return true;
+   } catch (const std::exception& e) { warn("cgemm", e); return false; }
+ }
++#endif
+ template <int B> bool qr_solve_t(const Mat& A, const Vec& b, Vec& x, int thr) {
+   try {
+     using F = limbforge::Float<B>; const size_t n = A.size(); const long long t0 = nowns();
+@@ -88,10 +154,11 @@
+     const long long t1 = nowns();
+     limbforge::QRFactor f = la().factor_qr(B, Ar.data(), n, n);
+     if (!f.full_rank()) throw std::runtime_error("QR: rank deficient");
+-    f.solve(br.data(), 1, xr.data());
++    auto solve_timing = f.solve(br.data(), 1, xr.data());
+     const long long t2 = nowns();
+     x.assign(n, C()); for (size_t i = 0; i < n; ++i) limbforge::to_mpfr<B>(mpc_realref(x[i].v), xr[i]);
+-    if (profile()) std::fprintf(stderr, "  [gpu] QR solve n = %zu (%d bits): pack %.3f s, factor+solve %.3f s\n", n, B, (t1 - t0) * 1e-9, (t2 - t1) * 1e-9);
++    if (profile()) std::fprintf(stderr, "  [WolfNum] QR solve n = %zu (%d bits): pack %.3f s, factor+solve %.3f s; factor device %.3f s, solve device %.3f s, host panels %.3f s, selected GPU/host block updates %zu/%zu\n", n, B, (t1 - t0) * 1e-9, (t2 - t1) * 1e-9,
++      f.info().timing.gpu_seconds, solve_timing.gpu_seconds, f.info().panel_seconds, f.info().gpu_updates, f.info().host_updates);
+     return true;
+   } catch (const std::exception& e) { warn("QR solve", e); return false; }
+ }
+@@ -131,16 +198,32 @@
+ #endif
+ 
+ 
++inline void validate_required_gemm() {
++  if (!require_gemm()) return;
++  if (!enabled() || std::getenv("SC_GPU_NOGEMM"))
++    throw std::runtime_error("SC_GPU_REQUIRE_GEMM requires SC_GPU=1 without SC_GPU_NOGEMM");
++#if !defined(SC_LIMBFORGE) || !defined(LIMBFORGE_GPU_REQUIRED_GEMM_API)
++  throw std::runtime_error("SC_GPU_REQUIRE_GEMM needs matching new WolfNum headers/archive");
++#endif
++}
+ inline bool cgemm(const Vec& A, size_t m, size_t k, const Vec& Bm, size_t n, Vec& Cm, int thr) {
+-#ifdef SC_LIMBFORGE
+-  if (!enabled() || std::getenv("SC_GPU_NOGEMM")) return false;
++  validate_required_gemm();
++#ifdef SC_LIMBFORGE
++  if (!enabled() || std::getenv("SC_GPU_NOGEMM")) {
++    if (require_gemm()) throw std::runtime_error("SC_GPU_REQUIRE_GEMM requires SC_GPU=1 without SC_GPU_NOGEMM");
++    return false;
++  }
++#ifndef LIMBFORGE_GPU_REQUIRED_GEMM_API
++  if (require_gemm()) throw std::runtime_error("GPU-required GEMM needs matching new WolfNum headers/archive");
++#endif
+   switch (bits()) {
+ #define SC_CASE(B) case B: return cgemm_t<B>(A, m, k, Bm, n, Cm, thr);
+     SC_LF_WIDTHS(SC_CASE)
+ #undef SC_CASE
+-    default: { const std::invalid_argument error("unsupported GPU width " + std::to_string(bits()) + " bits"); warn("cgemm", error); return false; }
+-  }
+-#else
++    default: { const std::invalid_argument error("unsupported GPU width " + std::to_string(bits()) + " bits"); if (require_gemm()) throw error; warn("cgemm", error); return false; }
++  }
++#else
++  if (require_gemm()) throw std::runtime_error("SC_GPU_REQUIRE_GEMM needs a WolfNum-enabled executable");
+   (void)A; (void)m; (void)k; (void)Bm; (void)n; (void)Cm; (void)thr; return false;
+ #endif
+ }
+--- a/cpp/src/sc_run.cpp
++++ b/cpp/src/sc_run.cpp
+@@ -7,6 +7,8 @@
+ using namespace sc;
+ 
+ int main(int argc, char** argv) {
++ try {
++  gpu::validate_required_gemm();
+   std::string gs = "10", seeds = "seeds/HPL2to10", out; int L = 2, chpw = 60, WP = 80, thr = 8, nP = 0, nQ = 0; double aP = 1, aQ = 1; bool seedsAlpha = false; bool full = false; std::vector<double> excl;
+   for (int i = 1; i < argc; ++i) { std::string a = argv[i]; auto nx = [&] { return std::string(argv[++i]); };
+     if (a == "--g") gs = nx(); else if (a == "--L") L = std::stoi(nx()); else if (a == "--chpw") chpw = std::stoi(nx()); else if (a == "--wp") WP = std::stoi(nx());
+@@ -44,4 +46,5 @@
+   { FData dd = evalF(M, its.back()); std::printf("errorP = %.3e, errorQ = %.3e\n", qsc::absd(dd.errorP), qsc::absd(dd.errorQ)); }
+   if (!out.empty()) { std::ofstream f(out); f << "# params " << its.back().size() << " " << nQ << " " << nP << " " << aQ << " " << aP << "\n"; for (auto& x : its.back()) f << real_str(x) << "\n"; }
+   return 0;
++ } catch (const std::exception& e) { std::cerr << "sc_run: " << e.what() << "\n"; return 1; }
+ }

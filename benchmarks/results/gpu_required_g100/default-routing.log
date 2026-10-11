@@ -1,0 +1,5 @@
+P production operands: 3 x 640 x 641, measured spread 1920 bits
+Default routing: WolfNum GPU-required GEMM: 3846 outputs would use host fallback; left/right fallback lines=0/641, max_bands=4, max_spread=512 (exponent-band limits)
+Q production operands: 3 x 540 x 541, measured spread 1472 bits
+Default routing: WolfNum GPU-required GEMM: 3246 outputs would use host fallback; left/right fallback lines=0/541, max_bands=4, max_spread=512 (exponent-band limits)
+Default routing analysis completed

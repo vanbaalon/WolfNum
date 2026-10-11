@@ -1,4 +1,5 @@
 #pragma once
+#define LIMBFORGE_GPU_REQUIRED_GEMM_API 1
 // Dense real products with one rounding per output (plan D6 via L1c): C[i][j] = RN(sum_k L[i][k]*R[k][j]),
 // or RN(C[i][j] - sum_k ...) as an update, computed exactly by an integer GEMM over residues (Metal TensorOps
 // int8) and rounded once, ties to even. Contract and algorithm: docs/numerics.md, "Dense products". Host arrays, and
@@ -153,6 +154,10 @@ public:
     // C (m x n) = op(A) B with B (k x n); op(A) = A (m x k) or, with transpose_a, A^T for A (k x m).
     // With subtract, C = RN(C - op(A) B), one rounding per entry.
     Timing gemm(int bits,bool transpose_a,const void* A,const void* B,std::size_t m,std::size_t n,std::size_t k,void* C,bool subtract=false);
+    // Same exact rounding as gemm; every nontrivial dot must execute on Metal. Data-dependent host fallback throws
+    // after analysis and before modifying C or issuing commands. Zero/status outputs may be assembled on the host.
+    // Configure exponent bands with LinalgOptions; this entry point never loosens limits or changes precision.
+    Timing gemm_gpu(int bits,bool transpose_a,const void* A,const void* B,std::size_t m,std::size_t n,std::size_t k,void* C,bool subtract=false);
     // Lower L (n x n, row-major) with A = L L^T from the lower triangle of symmetric positive definite A; the strict
     // upper triangle of L is set to zero. L may equal A (in place); otherwise they must not overlap.
     CholeskyInfo cholesky(int bits,const void* A,std::size_t n,void* L,const FactorOptions& options={});

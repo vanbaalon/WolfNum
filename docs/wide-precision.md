@@ -156,5 +156,66 @@ full-precision residual refinement with a reused 256-bit factor, reaching an
 error below 2^-1130 in eight solves. The 2048-bit case checks multi-block
 `norm_max` and `norm2` on values around 2^-1400. The actual strong-coupling adapter
 has been checked at 1152, 1536 and 2048 bits on small GEMM, repeated cached
-batches and a real QR solve with diagonal entries of 1e-400. These correctness
-checks establish no production-size timing or peak-memory result.
+batches and a real QR solve with diagonal entries of 1e-400. These small correctness
+checks establish no production-size timing or peak-memory result; the reconstruction
+replay below supplies separate production-size evidence.
+
+
+## Require GPU execution for reconstruction GEMMs
+
+The g=100, P640/Q540, WP270 operands exceed the default 512-bit exponent-spread
+limit. Calling `gemm` can therefore succeed with exact host products; the client
+previously labelled that call `[gpu]` despite its zero device time.
+
+`Linalg::gemm_gpu` uses the same exact rounding contract and rejects any
+nontrivial output that would use host fallback. Rejection happens after metadata
+analysis, before commands are submitted or C is modified. The last report retains
+the input band/fallback-line diagnostics. Empty, zero and status products require
+no device dot and may be assembled on the host. Existing `gemm` behavior is unchanged.
+The new API is identified by `LIMBFORGE_GPU_REQUIRED_GEMM_API`. It supports the
+synchronous host-array interface, including transpose and subtract updates.
+
+The strong-coupling adapter now measures input exponent ranges using MPFR metadata,
+selects 512-bit bands and a sufficient band count/spread bound, and uses 128
+complex rows per tile to bound packed input, residues and accumulator memory.
+Each tile uses `gemm_gpu` and verifies the output counters. The input precision and
+rounding sequence are unchanged. No entry is flushed or approximated to fit a band.
+
+The incremental client patch is [strong-coupling-gpu-required.patch](strong-coupling-gpu-required.patch),
+applied after the earlier wide-width adapter patch. Rebuild matching headers/archive
+and use `SC_GPU=1 SC_GPU_REQUIRE_GEMM=1`. This requirement applies to the large
+dense reconstruction products. It prevents both internal exact-host products and
+the client's outer CPU fallback; unsupported data, missing GPU support or disabled
+GEMM stops the run. `sc_run` validates that configuration before precomputation.
+Without the requirement flag the adapter retains its warned outer CPU fallback.
+
+The rebuilt executable on this machine is `cpp/build-gpu-required/sc_run`. For
+the target case, from the client cpp directory:
+
+```sh
+SC_GPU=1 SC_GPU_REQUIRE_GEMM=1 SC_GPU_PROFILE=1 \
+  ./build-gpu-required/sc_run --g 100 --threads 16 --chpw 640 \
+  --np 640 --nq 540 --wp 270 --seeds runs/scan_hi \
+  --seeds-in-alpha --alpha-q auto --alpha-p auto
+```
+
+The QR driver remains a hybrid algorithm with host panels. Its profile now
+reports factor and solve device times, host panel time and selected GPU/host
+block-update counts. A GPU-selected block can still contain data-dependent exact
+host products; that count alone is not proof of all-device QR execution. The
+GEMM requirement does not force QR placement. Existing `SC_CPU_SOLVE=1` can retain
+the caller's CPU LU solve while accelerating reconstruction and chain products.
+
+Full-size reconstruction replay at 1152 bits gave:
+
+| Complex shape m × k × n | Nontrivial real GPU outputs | Host products | GEMM wall | Device time |
+|---|---:|---:|---:|---:|
+| 11820 × 640 × 641 | 15,153,240 | 0 | 25.727 s | 22.494 s |
+| 11820 × 540 × 541 | 12,789,240 | 0 | 16.030 s | 14.215 s |
+
+The measured spread bounds were 1920 and 1472 bits. Forty real-component output
+samples per product matched exact MPFR, including first/last rows and tile
+boundaries. Records, exact basis input and reproducers are retained under
+`benchmarks/results/gpu_required_g100`. Concurrent CPU jobs were active. These
+are reconstruction-only diagnostic timings, not an idle benchmark or a rerun of
+the complete solver's Delta/errorP/Newton timing.

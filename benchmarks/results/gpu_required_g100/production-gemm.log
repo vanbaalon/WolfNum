@@ -1,0 +1,7 @@
+P production operands: 11820 x 640 x 641, measured spread 1920 bits
+  [WolfNum] cgemm 11820 x 640 x 641 (1152 bits): pack 2.320 s, gemm 25.727 s (device 22.494 s), unpack 0.762 s; GPU outputs=15153240, host fallback=0, trivial=0, tiles=93, spread limit=1920
+40 real-component samples match single-round exact MPFR (including tile boundaries and last row)
+Q production operands: 11820 x 540 x 541, measured spread 1472 bits
+  [WolfNum] cgemm 11820 x 540 x 541 (1152 bits): pack 1.609 s, gemm 16.030 s (device 14.215 s), unpack 0.344 s; GPU outputs=12789240, host fallback=0, trivial=0, tiles=93, spread limit=1472
+40 real-component samples match single-round exact MPFR (including tile boundaries and last row)
+Production reconstruction GEMM GPU-placement verification passed

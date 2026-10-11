@@ -1,0 +1,6 @@
+512 bits: strict GPU products/updates/transpose match MPFR; fallback rejected before writing C
+928 bits: strict GPU products/updates/transpose match MPFR; fallback rejected before writing C
+1024 bits: strict GPU products/updates/transpose match MPFR; fallback rejected before writing C
+1152 bits: strict GPU products/updates/transpose match MPFR; fallback rejected before writing C
+1536 bits: strict GPU products/updates/transpose match MPFR; fallback rejected before writing C
+2048 bits: strict GPU products/updates/transpose match MPFR; fallback rejected before writing C

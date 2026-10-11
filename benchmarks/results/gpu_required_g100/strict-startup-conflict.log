@@ -1,0 +1,1 @@
+sc_run: SC_GPU_REQUIRE_GEMM requires SC_GPU=1 without SC_GPU_NOGEMM
