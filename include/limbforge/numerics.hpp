@@ -2,7 +2,7 @@
 // Polynomial values and Taylor jets (plan S1) and norms / status summaries (plan S4): host arrays, with their own Metal
 // queue and runtime-compiled library (src/numerics.metal), and resident versions encoded into an Engine's CommandBatch. Contracts and exact rounding sequences:
 // docs/numerics.md, "Polynomial values and jets" and "Norms and status summaries". Elements are Float<bits>
-// (Number<bits/32>, bits/8 + 12 bytes) or Complex<bits/32>; bits is a multiple of 32 in [64, 1024].
+// (Number<bits/32>, bits/8 + 12 bytes) or Complex<bits/32>; bits is a multiple of 32 in [64, 2048].
 #include "core.hpp"
 #include "engine.hpp"
 #include <cstddef>

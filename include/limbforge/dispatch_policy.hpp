@@ -19,7 +19,7 @@ class BreakEvenTable {
     std::map<DispatchKey,DispatchSample> samples_;
 public:
     void record(const DispatchKey& key,DispatchSample sample){
-        if(key.operation.empty()||key.bits<64||key.bits>1024||key.bits%32||!key.cpu_workers||
+        if(key.operation.empty()||key.bits<64||key.bits>2048||key.bits%32||!key.cpu_workers||
            !std::isfinite(sample.cpu_wall)||!std::isfinite(sample.gpu_wall)||sample.cpu_wall<=0||sample.gpu_wall<=0)
             throw std::invalid_argument("break-even table: invalid key or timing");
         samples_[key]=sample;

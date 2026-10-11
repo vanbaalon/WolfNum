@@ -19,6 +19,16 @@ using word = std::uint32_t;
 using dword = std::uint64_t;
 using exponent_type = std::int64_t;
 #endif
+// Storage and algebra widths; transcendental kernels retain their separately validated 1024-bit limit.
+enum : int {min_precision_bits=64,max_precision_bits=2048};
+constexpr bool precision_supported(int bits){return bits>=min_precision_bits&&bits<=max_precision_bits&&bits%32==0;}
+#if defined(__METAL_VERSION__) && LF_BITS > 1024
+#define LIMBFORGE_WIDE_LOOP _Pragma("clang loop unroll(disable)")
+#define LIMBFORGE_COMPOSE_INLINE __attribute__((noinline))
+#else
+#define LIMBFORGE_WIDE_LOOP
+#define LIMBFORGE_COMPOSE_INLINE inline
+#endif
 enum Status : word { ok=0, division_by_zero=1, exponent_overflow=2, invalid=4 };
 template<int N> struct Number {
     word limb[N]; // little endian; top bit set for every nonzero value
@@ -27,7 +37,7 @@ template<int N> struct Number {
     word status;
 };
 template<int Bits> struct FloatType {
-    static_assert(Bits>=64&&Bits<=1024&&Bits%32==0,"precision must be a multiple of 32 in [64,1024]");
+    static_assert(Bits>=64&&Bits<=2048&&Bits%32==0,"precision must be a multiple of 32 in [64,2048]");
     using type=Number<Bits/32>;
 };
 template<int Bits> using Float = typename FloatType<Bits>::type;
@@ -44,12 +54,12 @@ constexpr int scratch(int words){
 #endif
 }
 template<int N> inline Number<N> zero(word status=ok) {
-    Number<N> r; for(int i=0;i<N;++i)r.limb[i]=0;
+    Number<N> r; LIMBFORGE_WIDE_LOOP for(int i=0;i<N;++i)r.limb[i]=0;
     r.exponent=0;r.sign=0;r.status=status;return r;
 }
 template<int N> inline Number<N> negate(Number<N> a){a.sign=-a.sign;return a;}
 template<int W> inline int highest(LIMBFORGE_THREAD const word (&a)[W]) {
-    for(int i=W-1;i>=0;--i)if(a[i]) {
+    LIMBFORGE_WIDE_LOOP for(int i=W-1;i>=0;--i)if(a[i]) {
 #ifdef __METAL_VERSION__
         return 32*i+31-int(metal::clz(a[i]));
 #else
@@ -67,11 +77,11 @@ template<int W> inline word extract(LIMBFORGE_THREAD const word (&a)[W],int bit)
 template<int W> inline bool any_below(LIMBFORGE_THREAD const word (&a)[W],int bit) {
     if(bit<=0)return false;
     int whole=bit/32;
-    for(int i=0;i<W&&i<whole;++i)if(a[i])return true;
+    LIMBFORGE_WIDE_LOOP for(int i=0;i<W&&i<whole;++i)if(a[i])return true;
     return whole<W&&(bit%32)&&(a[whole]&((word(1)<<(bit%32))-1));
 }
 template<int N> inline void increment(LIMBFORGE_THREAD Number<N>& r) {
-    for(int i=0;i<N;++i)if(++r.limb[i])return;
+    LIMBFORGE_WIDE_LOOP for(int i=0;i<N;++i)if(++r.limb[i])return;
     r.limb[N-1]=word(1)<<31;++r.exponent;
 }
 template<int N> inline Number<N> checked(Number<N> r) {
@@ -86,12 +96,12 @@ template<int N,int W> inline Number<N> pack(LIMBFORGE_THREAD const word (&a)[W],
     Number<N> r=zero<N>(status);r.sign=sign;r.exponent=int(e);
     int shift=h-(32*N-1);
     if(shift>=0) {
-        for(int i=0;i<N;++i)r.limb[i]=extract(a,shift+32*i);
+        LIMBFORGE_WIDE_LOOP for(int i=0;i<N;++i)r.limb[i]=extract(a,shift+32*i);
         if(shift>0&&((extract(a,shift-1)&1)!=0)&&
            (any_below(a,shift-1)||(r.limb[0]&1)))increment(r);
     } else {
         int left=-shift,w=left/32,s=left%32;
-        for(int i=0;i<W;++i)if(i+w<N) {
+        LIMBFORGE_WIDE_LOOP for(int i=0;i<W;++i)if(i+w<N) {
             r.limb[i+w]|=a[i]<<s;
             if(s&&i+w+1<N)r.limb[i+w+1]|=a[i]>>(32-s);
         }
@@ -100,12 +110,12 @@ template<int N,int W> inline Number<N> pack(LIMBFORGE_THREAD const word (&a)[W],
 template<int N> inline int magnitude_compare(LIMBFORGE_THREAD const Number<N>& a,LIMBFORGE_THREAD const Number<N>& b) {
     if(!a.sign)return b.sign?-1:0;if(!b.sign)return 1;
     if(a.exponent!=b.exponent)return a.exponent>b.exponent?1:-1;
-    for(int i=N-1;i>=0;--i)if(a.limb[i]!=b.limb[i])return a.limb[i]>b.limb[i]?1:-1;
+    LIMBFORGE_WIDE_LOOP for(int i=N-1;i>=0;--i)if(a.limb[i]!=b.limb[i])return a.limb[i]>b.limb[i]?1:-1;
     return 0;
 }
 template<int N,int W> inline void insert(LIMBFORGE_THREAD word (&out)[W],LIMBFORGE_THREAD const Number<N>& a,int shift) {
     int w=shift/32,s=shift%32;
-    for(int i=0;i<N;++i){out[i+w]|=a.limb[i]<<s;if(s)out[i+w+1]|=a.limb[i]>>(32-s);}
+    LIMBFORGE_WIDE_LOOP for(int i=0;i<N;++i){out[i+w]|=a.limb[i]<<s;if(s)out[i+w+1]|=a.limb[i]>>(32-s);}
 }
 template<int N> inline word shifted_limb(LIMBFORGE_THREAD const Number<N>& a,int shift,int position){
     int source=position-shift/32,s=shift%32;
@@ -116,11 +126,11 @@ template<int N> inline word shifted_limb(LIMBFORGE_THREAD const Number<N>& a,int
 template<int N,int W> inline Number<N> aligned_add(LIMBFORGE_THREAD const Number<N>& a,LIMBFORGE_THREAD const Number<N>& b,int a_shift,int b_shift,exponent_type scale){
     // Padding the addition workspace helps only from 512 bits (interleaved A/B, round 14).
     word x[N>=16?scratch(W):W]={};insert(x,a,a_shift);dword carry=0;
-    if(a.sign==b.sign)for(int i=0;i<W;++i){dword v=dword(x[i])+shifted_limb(b,b_shift,i)+carry;x[i]=word(v);carry=v>>32;}
-    else for(int i=0;i<W;++i){dword v=dword(shifted_limb(b,b_shift,i))+carry;word old=x[i];x[i]=word(dword(old)-v);carry=dword(old)<v;}
+    if(a.sign==b.sign)LIMBFORGE_WIDE_LOOP for(int i=0;i<W;++i){dword v=dword(x[i])+shifted_limb(b,b_shift,i)+carry;x[i]=word(v);carry=v>>32;}
+    else LIMBFORGE_WIDE_LOOP for(int i=0;i<W;++i){dword v=dword(shifted_limb(b,b_shift,i))+carry;word old=x[i];x[i]=word(dword(old)-v);carry=dword(old)<v;}
     return pack<N>(x,scale,a.sign,ok);
 }
-template<int N> inline Number<N> add(Number<N> a,Number<N> b) {
+template<int N> LIMBFORGE_COMPOSE_INLINE Number<N> add(Number<N> a,Number<N> b) {
     word status=a.status|b.status;if(status)return zero<N>(status);
     if(!a.sign)return b;if(!b.sign)return a;
     if(magnitude_compare(a,b)<0){Number<N> t=a;a=b;b=t;}
@@ -134,11 +144,11 @@ template<int N> inline Number<N> add(Number<N> a,Number<N> b) {
 }
 template<int N> inline Number<N> sub(Number<N> a,Number<N> b){return add(a,negate(b));}
 // Padded=false keeps the register-resident layout: complex kernels measured no gain from padding.
-template<int N,bool Padded=true> inline Number<N> mul(LIMBFORGE_THREAD const Number<N>& a,LIMBFORGE_THREAD const Number<N>& b) {
+template<int N,bool Padded=true> LIMBFORGE_COMPOSE_INLINE Number<N> mul(LIMBFORGE_THREAD const Number<N>& a,LIMBFORGE_THREAD const Number<N>& b) {
     word status=a.status|b.status;if(status||!a.sign||!b.sign)return zero<N>(status);
     word product[Padded?scratch(2*N+1):2*N+1]={};
-    for(int i=0;i<N;++i){dword carry=0;
-        for(int j=0;j<N;++j){dword v=dword(a.limb[i])*b.limb[j]+product[i+j]+carry;product[i+j]=word(v);carry=v>>32;}
+    LIMBFORGE_WIDE_LOOP for(int i=0;i<N;++i){dword carry=0;
+        LIMBFORGE_WIDE_LOOP for(int j=0;j<N;++j){dword v=dword(a.limb[i])*b.limb[j]+product[i+j]+carry;product[i+j]=word(v);carry=v>>32;}
         product[i+N]=word(carry);
     }
     return pack<N>(product,exponent_type(a.exponent)+b.exponent-2*(32*N-1),a.sign*b.sign,status);
@@ -152,22 +162,22 @@ template<int N> inline Number<N> square(LIMBFORGE_THREAD const Number<N>& a){
     if(a.status||!a.sign)return zero<N>(a.status);
     word product[scratch(2*N+1)]={};
     // Accumulate each off-diagonal product once, then double the exact integer.
-    for(int i=0;i<N-1;++i){dword carry=0;
-        for(int j=i+1;j<N;++j){dword v=dword(a.limb[i])*a.limb[j]+product[i+j]+carry;product[i+j]=word(v);carry=v>>32;}
+    LIMBFORGE_WIDE_LOOP for(int i=0;i<N-1;++i){dword carry=0;
+        LIMBFORGE_WIDE_LOOP for(int j=i+1;j<N;++j){dword v=dword(a.limb[i])*a.limb[j]+product[i+j]+carry;product[i+j]=word(v);carry=v>>32;}
         product[i+N]=word(carry);
     }
-    word carry=0;for(int i=0;i<2*N+1;++i){word old=product[i];product[i]=(old<<1)|carry;carry=old>>31;}
+    word carry=0;LIMBFORGE_WIDE_LOOP for(int i=0;i<2*N+1;++i){word old=product[i];product[i]=(old<<1)|carry;carry=old>>31;}
     // Add the diagonal with bounded sums; never double a full 64-bit product.
-    for(int i=0;i<N;++i){dword p=dword(a.limb[i])*a.limb[i];
+    LIMBFORGE_WIDE_LOOP for(int i=0;i<N;++i){dword p=dword(a.limb[i])*a.limb[i];
         dword v=dword(product[2*i])+word(p);product[2*i]=word(v);
         v=dword(product[2*i+1])+(p>>32)+(v>>32);product[2*i+1]=word(v);
-        dword c=v>>32;for(int j=2*i+2;c&&j<2*N+1;++j){v=dword(product[j])+c;product[j]=word(v);c=v>>32;}
+        dword c=v>>32;LIMBFORGE_WIDE_LOOP for(int j=2*i+2;c&&j<2*N+1;++j){v=dword(product[j])+c;product[j]=word(v);c=v>>32;}
     }
     return pack<N>(product,2*exponent_type(a.exponent)-2*(32*N-1),1,ok);
 }
 template<int N> inline int limb_compare(LIMBFORGE_THREAD const word (&a)[N+1],LIMBFORGE_THREAD const Number<N>& b) {
     if(a[N])return 1;
-    for(int i=N-1;i>=0;--i)if(a[i]!=b.limb[i])return a[i]>b.limb[i]?1:-1;
+    LIMBFORGE_WIDE_LOOP for(int i=N-1;i>=0;--i)if(a[i]!=b.limb[i])return a[i]>b.limb[i]?1:-1;
     return 0;
 }
 // Exact two-limb / normalized one-limb quotient using a reused reciprocal.
@@ -182,11 +192,11 @@ inline WordDivision divide_word(word high,word low,word d,word inv){
     if(r>=d){++q;r-=d;}
     return {q,r};
 }
-template<int N,bool Padded=true> inline Number<N> div(LIMBFORGE_THREAD const Number<N>& a,LIMBFORGE_THREAD const Number<N>& b) {
+template<int N,bool Padded=true> LIMBFORGE_COMPOSE_INLINE Number<N> div(LIMBFORGE_THREAD const Number<N>& a,LIMBFORGE_THREAD const Number<N>& b) {
     word status=a.status|b.status;if(status)return zero<N>(status);
     if(!b.sign)return zero<N>(division_by_zero);if(!a.sign)return zero<N>();
     // Normalized base-2^32 Knuth division. O(N^2), no bit-at-a-time quotient.
-    int cmp=0;for(int i=N-1;i>=0;--i)if(a.limb[i]!=b.limb[i]){cmp=a.limb[i]>b.limb[i]?1:-1;break;}
+    int cmp=0;LIMBFORGE_WIDE_LOOP for(int i=N-1;i>=0;--i)if(a.limb[i]!=b.limb[i]){cmp=a.limb[i]>b.limb[i]?1:-1;break;}
     int shift=32*N-1+(cmp<0);
     word u[Padded?scratch(2*N+1):2*N+1]={};insert(u,a,shift);
     Number<N> r=zero<N>();r.sign=a.sign*b.sign;
@@ -195,20 +205,20 @@ template<int N,bool Padded=true> inline Number<N> div(LIMBFORGE_THREAD const Num
     r.exponent=int(e);
     constexpr dword B=dword(1)<<32;
     word d=b.limb[N-1],inv=word(~dword(0)/d-B);
-    for(int j=N;j>=0;--j) {
+    LIMBFORGE_WIDE_LOOP for(int j=N;j>=0;--j) {
         dword top=(dword(u[j+N])<<32)|u[j+N-1];
         dword q,rem;
         if(u[j+N]>=d){q=B-1;rem=top-q*d;}
         else {auto estimate=divide_word(u[j+N],u[j+N-1],d,inv);q=estimate.quotient;rem=estimate.remainder;}
         if(N>1)while(rem<B&&q*b.limb[N-2]>(rem<<32)+u[j+N-2]){--q;rem+=b.limb[N-1];}
         dword borrow=0;
-        for(int i=0;i<N;++i){dword p=q*b.limb[i]+borrow;word low=word(p),old=u[j+i];u[j+i]=old-low;borrow=(p>>32)+(old<low);}
+        LIMBFORGE_WIDE_LOOP for(int i=0;i<N;++i){dword p=q*b.limb[i]+borrow;word low=word(p),old=u[j+i];u[j+i]=old-low;borrow=(p>>32)+(old<low);}
         bool under=dword(u[j+N])<borrow;u[j+N]=word(dword(u[j+N])-borrow);
-        if(under){--q;dword carry=0;for(int i=0;i<N;++i){dword v=dword(u[j+i])+b.limb[i]+carry;u[j+i]=word(v);carry=v>>32;}u[j+N]+=word(carry);}
+        if(under){--q;dword carry=0;LIMBFORGE_WIDE_LOOP for(int i=0;i<N;++i){dword v=dword(u[j+i])+b.limb[i]+carry;u[j+i]=word(v);carry=v>>32;}u[j+N]+=word(carry);}
         if(j<N)r.limb[j]=word(q);
     }
     word twice[N+1]={};word carry=0;
-    for(int i=0;i<N;++i){twice[i]=(u[i]<<1)|carry;carry=u[i]>>31;}twice[N]=carry;
+    LIMBFORGE_WIDE_LOOP for(int i=0;i<N;++i){twice[i]=(u[i]<<1)|carry;carry=u[i]>>31;}twice[N]=carry;
     int halfway=limb_compare<N>(twice,b);
     if(halfway>0||(halfway==0&&(r.limb[0]&1)))increment(r);
     return checked(r);
@@ -220,13 +230,13 @@ template<int N> inline Number<N> sqrt(LIMBFORGE_THREAD const Number<N>& a){
     int odd=a.exponent-2*e,shift=32*N-1+odd;
     Number<N> root=zero<N>();root.sign=1;root.exponent=e;
     word remainder[N+1]={},trial[N+1]={};
-    for(int bit=32*N-1;bit>=0;--bit){
+    LIMBFORGE_WIDE_LOOP for(int bit=32*N-1;bit>=0;--bit){
         int position=2*bit;word pair=(shifted_limb(a,shift,position/32)>>(position%32))&3;
-        word carry=pair;for(int i=0;i<N+1;++i){word old=remainder[i];remainder[i]=(old<<2)|carry;carry=old>>30;}
-        carry=0;for(int i=0;i<N;++i){word old=root.limb[i];root.limb[i]=(old<<1)|carry;carry=old>>31;}
-        carry=1;for(int i=0;i<N;++i){word old=root.limb[i];trial[i]=(old<<1)|carry;carry=old>>31;}trial[N]=carry;
-        int cmp=0;for(int i=N;i>=0;--i)if(remainder[i]!=trial[i]){cmp=remainder[i]>trial[i]?1:-1;break;}
-        if(cmp>=0){dword borrow=0;for(int i=0;i<N+1;++i){dword v=dword(trial[i])+borrow;word old=remainder[i];remainder[i]=word(dword(old)-v);borrow=dword(old)<v;}root.limb[0]|=1;}
+        word carry=pair;LIMBFORGE_WIDE_LOOP for(int i=0;i<N+1;++i){word old=remainder[i];remainder[i]=(old<<2)|carry;carry=old>>30;}
+        carry=0;LIMBFORGE_WIDE_LOOP for(int i=0;i<N;++i){word old=root.limb[i];root.limb[i]=(old<<1)|carry;carry=old>>31;}
+        carry=1;LIMBFORGE_WIDE_LOOP for(int i=0;i<N;++i){word old=root.limb[i];trial[i]=(old<<1)|carry;carry=old>>31;}trial[N]=carry;
+        int cmp=0;LIMBFORGE_WIDE_LOOP for(int i=N;i>=0;--i)if(remainder[i]!=trial[i]){cmp=remainder[i]>trial[i]?1:-1;break;}
+        if(cmp>=0){dword borrow=0;LIMBFORGE_WIDE_LOOP for(int i=0;i<N+1;++i){dword v=dword(trial[i])+borrow;word old=remainder[i];remainder[i]=word(dword(old)-v);borrow=dword(old)<v;}root.limb[0]|=1;}
     }
     // Integer radicand: sqrt(Z) > q+1/2 exactly when Z-q*q > q.
     // Equality to a half-integer is impossible, so no tie-breaking is needed.
@@ -243,29 +253,29 @@ constexpr int exact_words(int n,int a,int b){
 }
 template<int W,int A> inline void place(LIMBFORGE_THREAD word (&out)[W],LIMBFORGE_THREAD const word (&in)[A],exponent_type shift){
     int w=int(shift/32),s=int(shift%32);
-    for(int i=0;i<A;++i){if(i+w<W)out[i+w]|=in[i]<<s;if(s&&i+w+1<W)out[i+w+1]|=in[i]>>(32-s);}
+    LIMBFORGE_WIDE_LOOP for(int i=0;i<A;++i){if(i+w<W)out[i+w]|=in[i]<<s;if(s&&i+w+1<W)out[i+w+1]|=in[i]>>(32-s);}
 }
 template<int W,int A> inline Exact<W> exact_copy(LIMBFORGE_THREAD const Exact<A>& x){
-    Exact<W> r;for(int i=0;i<W;++i)r.w[i]=i<A?x.w[i]:0;r.scale=x.scale;r.sign=x.sign;return r;
+    Exact<W> r;LIMBFORGE_WIDE_LOOP for(int i=0;i<W;++i)r.w[i]=i<A?x.w[i]:0;r.scale=x.scale;r.sign=x.sign;return r;
 }
 // x has the larger msb. x's window is extended to at least 32N+34 bits below its msb. If y lies
 // more than one bit below that window, |y| < 2^(low-1) changes no rounding decision of a 32N-bit
 // result: only its sign matters, kept as one unit below the window. Otherwise the sum is exact.
 template<int N,int W,int A,int B> inline Exact<W> exact_add_ordered(LIMBFORGE_THREAD const Exact<A>& x,LIMBFORGE_THREAD const Exact<B>& y){
-    Exact<W> r;for(int i=0;i<W;++i)r.w[i]=0;
+    Exact<W> r;LIMBFORGE_WIDE_LOOP for(int i=0;i<W;++i)r.w[i]=0;
     exponent_type mx=exact_msb(x),my=exact_msb(y),low=mx-(32*N+33);if(x.scale<low)low=x.scale;
     if(my<low-1){
         r.scale=low-32;r.sign=x.sign;place(r.w,x.w,x.scale-r.scale);
-        if(x.sign==y.sign)r.w[0]=1;else for(int i=0;i<W;++i){word old=r.w[i];r.w[i]=old-1;if(old)break;}
+        if(x.sign==y.sign)r.w[0]=1;else LIMBFORGE_WIDE_LOOP for(int i=0;i<W;++i){word old=r.w[i];r.w[i]=old-1;if(old)break;}
         return r;
     }
-    r.scale=x.scale<y.scale?x.scale:y.scale;word t[W];for(int i=0;i<W;++i)t[i]=0;
+    r.scale=x.scale<y.scale?x.scale:y.scale;word t[W];LIMBFORGE_WIDE_LOOP for(int i=0;i<W;++i)t[i]=0;
     place(r.w,x.w,x.scale-r.scale);place(t,y.w,y.scale-r.scale);
-    if(x.sign==y.sign){dword c=0;for(int i=0;i<W;++i){dword v=dword(r.w[i])+t[i]+c;r.w[i]=word(v);c=v>>32;}r.sign=x.sign;return r;}
-    int cmp=0;for(int i=W-1;i>=0;--i)if(r.w[i]!=t[i]){cmp=r.w[i]>t[i]?1:-1;break;}
-    if(!cmp){r.sign=0;r.scale=0;for(int i=0;i<W;++i)r.w[i]=0;return r;}
+    if(x.sign==y.sign){dword c=0;LIMBFORGE_WIDE_LOOP for(int i=0;i<W;++i){dword v=dword(r.w[i])+t[i]+c;r.w[i]=word(v);c=v>>32;}r.sign=x.sign;return r;}
+    int cmp=0;LIMBFORGE_WIDE_LOOP for(int i=W-1;i>=0;--i)if(r.w[i]!=t[i]){cmp=r.w[i]>t[i]?1:-1;break;}
+    if(!cmp){r.sign=0;r.scale=0;LIMBFORGE_WIDE_LOOP for(int i=0;i<W;++i)r.w[i]=0;return r;}
     dword borrow=0;
-    for(int i=0;i<W;++i){word p=cmp>0?r.w[i]:t[i],q=cmp>0?t[i]:r.w[i];dword v=dword(q)+borrow;r.w[i]=word(dword(p)-v);borrow=dword(p)<v;}
+    LIMBFORGE_WIDE_LOOP for(int i=0;i<W;++i){word p=cmp>0?r.w[i]:t[i],q=cmp>0?t[i]:r.w[i];dword v=dword(q)+borrow;r.w[i]=word(dword(p)-v);borrow=dword(p)<v;}
     r.sign=cmp>0?x.sign:y.sign;return r;
 }
 template<int N,int W,int A,int B> inline Exact<W> exact_add(LIMBFORGE_THREAD const Exact<A>& x,LIMBFORGE_THREAD const Exact<B>& y){
@@ -278,15 +288,15 @@ template<int N,int W,int A,int B> inline Exact<W> exact_add(LIMBFORGE_THREAD con
 constexpr int exact_sum_words(int w){return (w+3)&~3;}
 template<int N> constexpr int product_words(){return scratch(2*N+1);}
 template<int N,int P=product_words<N>()> inline Exact<P> exact_product(LIMBFORGE_THREAD const Number<N>& a,LIMBFORGE_THREAD const Number<N>& b){
-    Exact<P> r;for(int i=0;i<P;++i)r.w[i]=0;
+    Exact<P> r;LIMBFORGE_WIDE_LOOP for(int i=0;i<P;++i)r.w[i]=0;
     r.scale=exponent_type(a.exponent)+b.exponent-2*(32*N-1);r.sign=a.sign*b.sign;if(!r.sign){r.scale=0;return r;}
-    for(int i=0;i<N;++i){dword carry=0;
-        for(int j=0;j<N;++j){dword v=dword(a.limb[i])*b.limb[j]+r.w[i+j]+carry;r.w[i+j]=word(v);carry=v>>32;}
+    LIMBFORGE_WIDE_LOOP for(int i=0;i<N;++i){dword carry=0;
+        LIMBFORGE_WIDE_LOOP for(int j=0;j<N;++j){dword v=dword(a.limb[i])*b.limb[j]+r.w[i+j]+carry;r.w[i+j]=word(v);carry=v>>32;}
         r.w[i+N]=word(carry);}
     return r;
 }
 template<int W,int N> inline Exact<W> exact_number(LIMBFORGE_THREAD const Number<N>& c){
-    Exact<W> r;for(int i=0;i<W;++i)r.w[i]=i<N?c.limb[i]:0;
+    Exact<W> r;LIMBFORGE_WIDE_LOOP for(int i=0;i<W;++i)r.w[i]=i<N?c.limb[i]:0;
     r.scale=exponent_type(c.exponent)-(32*N-1);r.sign=c.sign;return r;
 }
 template<int N,int W> inline Number<N> round_exact(LIMBFORGE_THREAD const Exact<W>& x){
@@ -296,9 +306,9 @@ template<int N,int W> inline Number<N> round_exact(LIMBFORGE_THREAD const Exact<
 // window (with room for carries and a sign bit), the sum is exact there and rounded once into r.
 // Returns false when the terms are spread too widely; callers then use the ordered exact path.
 template<int F,int A> inline void window_accumulate(LIMBFORGE_THREAD word (&acc)[F],LIMBFORGE_THREAD const Exact<A>& t,exponent_type lo){
-    if(!t.sign)return;word x[F];for(int k=0;k<F;++k)x[k]=0;place(x,t.w,t.scale-lo);
-    if(t.sign>0){dword c=0;for(int k=0;k<F;++k){dword v=dword(acc[k])+x[k]+c;acc[k]=word(v);c=v>>32;}}
-    else{dword b=0;for(int k=0;k<F;++k){dword v=dword(x[k])+b;word old=acc[k];acc[k]=word(dword(old)-v);b=dword(old)<v;}}
+    if(!t.sign)return;word x[F];LIMBFORGE_WIDE_LOOP for(int k=0;k<F;++k)x[k]=0;place(x,t.w,t.scale-lo);
+    if(t.sign>0){dword c=0;LIMBFORGE_WIDE_LOOP for(int k=0;k<F;++k){dword v=dword(acc[k])+x[k]+c;acc[k]=word(v);c=v>>32;}}
+    else{dword b=0;LIMBFORGE_WIDE_LOOP for(int k=0;k<F;++k){dword v=dword(x[k])+b;word old=acc[k];acc[k]=word(dword(old)-v);b=dword(old)<v;}}
 }
 template<int N,int F,int A,int B,int C> inline bool window_sum(LIMBFORGE_THREAD const Exact<A>& x,LIMBFORGE_THREAD const Exact<B>& y,LIMBFORGE_THREAD const Exact<C>& z,LIMBFORGE_THREAD Number<N>& r){
     exponent_type lo=0,hi=0;bool any=false;
@@ -307,10 +317,10 @@ template<int N,int F,int A,int B,int C> inline bool window_sum(LIMBFORGE_THREAD 
     if(z.sign){exponent_type l=z.scale,h=exact_msb(z);if(!any||l<lo)lo=l;if(!any||h>hi)hi=h;any=true;}
     if(!any){r=zero<N>();return true;}
     if(hi+3-lo>=exponent_type(32*F))return false;
-    word acc[F];for(int k=0;k<F;++k)acc[k]=0;
+    word acc[F];LIMBFORGE_WIDE_LOOP for(int k=0;k<F;++k)acc[k]=0;
     window_accumulate(acc,x,lo);window_accumulate(acc,y,lo);window_accumulate(acc,z,lo);
-    int sign=1;if(acc[F-1]>>31){sign=-1;dword c=1;for(int k=0;k<F;++k){dword v=dword(~acc[k])+c;acc[k]=word(v);c=v>>32;}}
-    bool nonzero=false;for(int k=0;k<F;++k)nonzero|=acc[k]!=0;
+    int sign=1;if(acc[F-1]>>31){sign=-1;dword c=1;LIMBFORGE_WIDE_LOOP for(int k=0;k<F;++k){dword v=dword(~acc[k])+c;acc[k]=word(v);c=v>>32;}}
+    bool nonzero=false;LIMBFORGE_WIDE_LOOP for(int k=0;k<F;++k)nonzero|=acc[k]!=0;
     r=nonzero?pack<N>(acc,lo,sign,ok):zero<N>();return true;
 }
 // RN(a*b+c) with a single rounding (MPFR mpfr_fma contract).
@@ -338,7 +348,7 @@ template<int N> inline Number<N> dot2_add(LIMBFORGE_THREAD const Number<N>& a,LI
     Exact<P> t[3]={exact_product(a,b),exact_product(c,d),exact_number<P>(e)};
     // Fast path: every nonzero term fits one exact two's-complement window (see window_sum).
     {Number<N> r;if(window_sum<N,exact_sum_words(scratch(3*N+4))>(t[0],t[1],t[2],r))return r;}
-    exponent_type key[3];for(int i=0;i<3;++i)key[i]=t[i].sign?exact_msb(t[i]):-(exponent_type(1)<<62);
+    exponent_type key[3];LIMBFORGE_WIDE_LOOP for(int i=0;i<3;++i)key[i]=t[i].sign?exact_msb(t[i]):-(exponent_type(1)<<62);
     // Three named terms ordered by msb, largest first.
     int i1=key[0]>=key[1]?(key[0]>=key[2]?0:2):(key[1]>=key[2]?1:2);
     int i3=key[0]<key[1]?(key[0]<key[2]?0:2):(key[1]<key[2]?1:2);if(i3==i1)i3=(i1+1)%3;
@@ -380,14 +390,14 @@ template<int N> inline Number<N> dot2_add_rolled(LIMBFORGE_THREAD const Number<N
     t[2]=exact_number<P>(e);
     // Window fast path (window_sum): every nonzero term within one F-word two's-complement window.
     exponent_type lo=0,hi=0,key[3];bool any=false;
-    for(int k=0;k<3;++k){key[k]=-(exponent_type(1)<<62);if(!t[k].sign)continue;exponent_type l=t[k].scale,h=exact_msb(t[k]);key[k]=h;
+    LIMBFORGE_WIDE_LOOP for(int k=0;k<3;++k){key[k]=-(exponent_type(1)<<62);if(!t[k].sign)continue;exponent_type l=t[k].scale,h=exact_msb(t[k]);key[k]=h;
         if(!any||l<lo)lo=l;if(!any||h>hi)hi=h;any=true;}
     if(!any)return zero<N>();
     if(hi+3-lo<exponent_type(32*F)){
-        word acc[F];for(int k=0;k<F;++k)acc[k]=0;
+        word acc[F];LIMBFORGE_WIDE_LOOP for(int k=0;k<F;++k)acc[k]=0;
         _Pragma("clang loop unroll(disable)") for(int k=0;k<3;++k)window_accumulate(acc,t[k],lo);
-        int sign=1;if(acc[F-1]>>31){sign=-1;dword c=1;for(int k=0;k<F;++k){dword v=dword(~acc[k])+c;acc[k]=word(v);c=v>>32;}}
-        bool nonzero=false;for(int k=0;k<F;++k)nonzero|=acc[k]!=0;
+        int sign=1;if(acc[F-1]>>31){sign=-1;dword c=1;LIMBFORGE_WIDE_LOOP for(int k=0;k<F;++k){dword v=dword(~acc[k])+c;acc[k]=word(v);c=v>>32;}}
+        bool nonzero=false;LIMBFORGE_WIDE_LOOP for(int k=0;k<F;++k)nonzero|=acc[k]!=0;
         return nonzero?pack<N>(acc,lo,sign,ok):zero<N>();
     }
     // General path of dot2_add: terms ordered by msb; either the two smaller ones are summed first (both far
@@ -411,12 +421,32 @@ template<int N> inline Complex<N> cfma_rolled(Complex<N> a,Complex<N> b,Complex<
     }
     return r;
 }
+#if defined(__METAL_VERSION__) && LF_BITS > 1024
+// Preserve composed roundings while avoiding repeated out-of-line add results inside a complex value.
+template<int N> inline Number<N> composed_add(Number<N> a,Number<N> b){
+    Number<N> one=zero<N>(),z=one;one.sign=1;one.limb[N-1]=0x80000000u;
+    return dot2_add_rolled(one,a,one,b,z);
+}
+template<int N> inline Complex<N> cadd(Complex<N> a,Complex<N> b){return {composed_add(a.re,b.re),composed_add(a.im,b.im)};}
+template<int N> inline Complex<N> cmul(Complex<N> a,Complex<N> b){
+    return {composed_add(mul<N,false>(a.re,b.re),negate(mul<N,false>(a.im,b.im))),composed_add(mul<N,false>(a.re,b.im),mul<N,false>(a.im,b.re))};
+}
+template<int N> inline Complex<N> cdiv(Complex<N> a,Complex<N> b){
+    Number<N> d=composed_add(mul<N,false>(b.re,b.re),mul<N,false>(b.im,b.im));
+    return {div<N,false>(composed_add(mul<N,false>(a.re,b.re),mul<N,false>(a.im,b.im)),d),div<N,false>(composed_add(mul<N,false>(a.im,b.re),negate(mul<N,false>(a.re,b.im))),d)};
+}
+#else
 template<int N> inline Complex<N> cadd(Complex<N> a,Complex<N> b){return {add(a.re,b.re),add(a.im,b.im)};}
 template<int N> inline Complex<N> cmul(Complex<N> a,Complex<N> b){return {sub(mul<N,false>(a.re,b.re),mul<N,false>(a.im,b.im)),add(mul<N,false>(a.re,b.im),mul<N,false>(a.im,b.re))};}
 template<int N> inline Complex<N> cdiv(Complex<N> a,Complex<N> b){
     Number<N> d=add(mul<N,false>(b.re,b.re),mul<N,false>(b.im,b.im));
     return {div<N,false>(add(mul<N,false>(a.re,b.re),mul<N,false>(a.im,b.im)),d),div<N,false>(sub(mul<N,false>(a.im,b.re),mul<N,false>(a.re,b.im)),d)};
 }
+#endif
 } // namespace limbforge
 
 #undef LIMBFORGE_THREAD
+
+#undef LIMBFORGE_WIDE_LOOP
+
+#undef LIMBFORGE_COMPOSE_INLINE

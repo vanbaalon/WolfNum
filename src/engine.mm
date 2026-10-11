@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <functional>
+#include <unistd.h>
 
 namespace limbforge {
 namespace {
@@ -23,7 +24,7 @@ std::size_t checked_size(std::size_t count,std::size_t stride) {
     return count*stride;
 }
 void validate(int bits,std::size_t count) {
-    if(bits<64||bits>1024||bits%32)throw std::invalid_argument("bits must be a multiple of 32 in [64,1024]");
+    if(bits<64||bits>2048||bits%32)throw std::invalid_argument("bits must be a multiple of 32 in [64,2048]");
     if(count>std::numeric_limits<std::uint32_t>::max())throw std::invalid_argument("batch exceeds 32-bit indexing");
 }
 struct Params {std::uint32_t count,operation,steps,weight_count,states_per_weight,b_stride,b_period,c_stride,c_period;};
@@ -89,7 +90,7 @@ struct Engine::Impl {
     std::mutex cache_mutex;
     id<MTLLibrary> library(int bits){
         {std::lock_guard<std::mutex> lock(cache_mutex);auto it=libraries.find(bits);if(it!=libraries.end())return it->second;}
-        NSString* source=[NSString stringWithFormat:@"#define MP_BITS %d\n%s",bits,limbforge_shader_source];
+        NSString* source=[NSString stringWithFormat:@"#define MP_BITS %d\n#define LF_BITS %d\n%s",bits,bits,limbforge_shader_source];
         MTLCompileOptions* options=[MTLCompileOptions new];
         options.mathMode=MTLMathModeSafe;options.languageVersion=MTLLanguageVersion3_1;
         NSError* error=nil;
@@ -149,7 +150,7 @@ struct Engine::Impl {
         for(int bits:r.bits){validate(bits,0);library(bits);
             for(auto op:r.operations){if(!operation_is_valid(op))throw std::invalid_argument("unknown arithmetic operation");pipeline(bits,int(op));}
             if(r.recurrence)for(int op:{100,105,106,107,108})if((op!=107||bits<=512)&&(op!=108||bits<=256))pipeline(bits,op);
-            if(r.reductions)for(int op:{101,102,103,104})pipeline(bits,op);
+            if(r.reductions)for(int op:{101,102,103,104})if(bits<=1024||op>=103)pipeline(bits,op);
             for(auto& v:r.vector_shapes){if(v.matrix&&v.tangent)throw std::invalid_argument("tangent mode requires the rank-one form");pipeline(bits,200+int(vector_flags(v)));}
             for(auto& d:r.real_dots)pipeline(bits,300+(d.shared_right?1:0));
             for(auto& d:r.complex_dots)pipeline(bits,302+(d.shared_right?1:0));
@@ -398,7 +399,7 @@ void CommandBatch::encode_tree_sum(int bits,bool complex,const std::shared_ptr<d
     validate(bits,count);impl_->retain(input);impl_->retain(out,true);
     // Wider complex values lose in repeated interleaved comparisons. Small
     // copies/pairs need no local tree or barriers at all.
-    bool cooperative=impl_->engine->options.cooperative_reductions&&count>2&&(!complex||bits<=384);
+    bool cooperative=impl_->engine->options.cooperative_reductions&&count>2&&bits<=1024&&(!complex||bits<=384);
     int operation=(complex?102:101)+(cooperative?0:2);auto state=impl_->engine->pipeline(bits,operation);
     unsigned group=impl_->engine->group_size(state,bits,operation);
     if(cooperative){
@@ -472,6 +473,7 @@ std::shared_ptr<detail::BufferStorage> Engine::allocate(std::size_t bytes){retur
 CommandBatch Engine::batch(){return CommandBatch(std::make_unique<CommandBatch::Impl>(impl));}
 Engine::Engine(EngineOptions options):impl(new Impl(options)){} Engine::~Engine()=default;
 std::string Engine::device_name()const{return std::string([impl->device.name UTF8String]);}
+DeviceLimits Engine::device_limits()const{return {std::size_t(impl->device.maxBufferLength),std::size_t(impl->device.recommendedMaxWorkingSetSize),std::size_t(getpagesize())};}
 PipelineInfo Engine::pipeline_info(int bits,Operation op){
     validate(bits,0);int operation=int(op);if(!operation_is_valid(op))throw std::invalid_argument("unknown arithmetic operation");
     auto state=impl->pipeline(bits,operation);return {unsigned(state.threadExecutionWidth),unsigned(state.maxTotalThreadsPerThreadgroup),impl->group_size(state,bits,operation)};

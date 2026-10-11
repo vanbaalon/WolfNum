@@ -281,8 +281,17 @@ template<int Bits> void suite(Linalg& la,bool thorough){
         factor<Bits>(la,matrix<Bits>(n+n/2+1,n,n%2?qsc:moderate,rng),n+n/2+1,n,"block boundary",rng,rs);
         if(n%16==0)factor<Bits>(la,matrix<Bits>(n,n,graded,rng),n,n,"square block boundary",rng,rs);}
 }
-int main(){try{
+template<int Bits> void wide_width(Linalg& la){std::mt19937_64 rng(Bits);QROptions g;g.block=3;g.host_macs=g.solve_host_macs=0;
+    QROptions h=g;h.gpu=false;std::vector<Run> rs={{"wide GPU",g},{"wide host",h}};
+    factor<Bits>(la,matrix<Bits>(13,7,qsc,rng),13,7,"wide",rng,rs);
+    auto tiny=matrix<Bits>(13,7,moderate,rng);for(auto& x:tiny)x.exponent-=1400;factor<Bits>(la,tiny,13,7,"tiny wide",rng,rs);
+    factor_pivoted<Bits>(la,tiny,13,7,"tiny pivoted wide",rng);std::cout<<Bits<<" bits: real QR matches MPFR"<<std::endl;
+}
+template<int B=1056> void wide_all(Linalg& la){wide_width<B>(la);if constexpr(B<2048)wide_all<B+32>(la);}
+int main(int argc,char** argv){try{
     Linalg la;std::cout<<la.device_name()<<"\n";
+    if(argc==2&&std::string(argv[1])=="--wide-all"){wide_all(la);return 0;}
+    if(argc==2&&std::string(argv[1])=="--wide"){wide_width<1056>(la);wide_width<1152>(la);wide_width<1536>(la);wide_width<2048>(la);return 0;}
     suite<224>(la,true);std::cout<<"qr 224 bits: match the MPFR sequence\n";
     suite<256>(la,true);std::cout<<"qr 256 bits: match the MPFR sequence\n";
     suite<64>(la,false);suite<384>(la,false);std::cout<<"qr 64, 384 bits: match the MPFR sequence\n";

@@ -6,7 +6,8 @@
 // (Linalg::factor_qr) bit for bit in the real parts and zero imaginary parts. Column pivoting (QROptions::pivot) against a separate
 // right-looking replay of the pivoted sequence (ref_qrp: permutation, rank, recomputed norms, R, V, tau, T, basic solutions), and
 // full-rank status-free pivoted factors against the unpivoted replay of A P.
-// Usage: test_limbforge_qr_complex [--quick] [--all-widths] (every 32-bit width from 64 to 1024 bits on small GPU shapes).
+// Usage: test_limbforge_qr_complex [--quick] [--all-widths] [--wide] [--wide-all] [--wide-from=bits].
+// Small GPU shapes at every 32-bit width: --all-widths covers 64..1024, --wide-all covers 1056..2048.
 #include "reference.hpp"
 #include "limbforge/linalg.hpp"
 #include <atomic>
@@ -197,7 +198,7 @@ template<int Bits> std::vector<CF<Bits>> matrix(std::size_t m,std::size_t n,Kind
             CF<Bits> z{reference::random_number<Bits>(rng,span),reference::random_number<Bits>(rng,span)};z.re.exponent+=int(scale);z.im.exponent+=int(scale);
             const unsigned u=unsigned(rng()%16);if(kind==realonly||u==0)z.im=zero<N>();else if(u==1)z.re=zero<N>();  // some purely real / imaginary entries
             if(kind==qsc&&rng()%4==0)z=czero<Bits>();A[r*n+c]=z;}
-        if(kind==qsc&&c%17==5){CF<Bits>& z=A[(rng()%m)*n+c];z.re.exponent=int(scale-150);z.im.exponent=int(scale-170);}}
+        if(kind==qsc&&c%17==5){CF<Bits>& z=A[(rng()%m)*n+c];if(z.re.sign)z.re.exponent=int(scale-150);if(z.im.sign)z.im.exponent=int(scale-170);}}
     if(kind==dependent&&n>=3)for(std::size_t r=0;r<m;++r){A[r*n+n-1]=A[r*n+1];const CF<Bits> z=A[r*n];A[r*n+n/2]={negate(z.im),z.re};} // column n/2 = i * column 0
     return A;
 }
@@ -360,9 +361,12 @@ template<int Bits> void width(Linalg& la){std::mt19937_64 rng(77+Bits);QROptions
     factor_pivoted<Bits>(la,matrix<Bits>(45,23,qsc,rng),45,23,"all widths",rng,0,SIZE_MAX,false,ps);
     factor_pivoted<Bits>(la,matrix<Bits>(41,7,dependent,rng),41,7,"all widths dependent",rng,Bits/2,5,false,ps);}
 template<int B=64> void all_widths(Linalg& la){width<B>(la);std::cout<<B<<' '<<std::flush;if constexpr(B<1024)all_widths<B+32>(la);}
+template<int B=1056> void wide_all(Linalg& la,int first=1056){if(B>=first){width<B>(la);std::cout<<B<<" bits: complex QR matches MPFR"<<std::endl;}if constexpr(B<2048)wide_all<B+32>(la,first);}
 int main(int argc,char** argv){try{
-    bool quick=false,widths=false;for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--quick")quick=true;else if(a=="--all-widths")widths=true;else throw std::invalid_argument("usage: test_limbforge_qr_complex [--quick] [--all-widths]");}
+    int first=1056;bool quick=false,widths=false,wide=false,wide_all_flag=false;for(int i=1;i<argc;++i){std::string a=argv[i];if(a.rfind("--wide-from=",0)==0){first=std::stoi(a.substr(12));if(first<1056||first>2048||first%32)throw std::invalid_argument("invalid wide start");wide_all_flag=true;}else if(a=="--wide-all")wide_all_flag=true;else if(a=="--wide")wide=true;else if(a=="--quick")quick=true;else if(a=="--all-widths")widths=true;else throw std::invalid_argument("usage: test_limbforge_qr_complex [--quick] [--all-widths] [--wide] [--wide-all] [--wide-from=bits]");}
     Linalg la;std::cout<<la.device_name()<<"\n";
+    if(wide_all_flag){wide_all(la,first);return 0;}
+    if(wide){width<1056>(la);width<1152>(la);width<1536>(la);width<2048>(la);return 0;}
     if(widths){std::cout<<"all widths: ";all_widths(la);std::cout<<"\n"<<factors_run<<" factorizations, "<<solves_run<<" solves and "<<applies_run<<" Q applications at every width bit-identical to the reference; "
                           <<pivoted_run<<" pivoted factorizations (with solves and Q applications) bit-identical to the pivoted reference\n";return 0;}
     suite<224>(la,!quick);std::cout<<"complex qr 224 bits: match the MPFR replay\n";

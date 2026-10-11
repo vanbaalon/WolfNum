@@ -10,7 +10,7 @@
 WolfNum is the standalone numerical library in the **Wolfbook family**, providing
 batched, high-precision real and complex arithmetic. It stores significands in
 32-bit integer limbs and executes
-precision-specialized Metal kernels, supporting **64–1024 significand bits** in
+precision-specialized Metal kernels, supporting **64–2048 significand bits** in
 steps of 32. Real arithmetic uses round-to-nearest, ties-to-even.
 
 **Author: Nikolay Gromov.**
@@ -167,6 +167,13 @@ or MPFR; converting an existing `double` cannot restore lost digits.
 | 256 | 77 digits |
 | 384 | 116 digits |
 | 1024 | 308 digits |
+| 1152 | 346 digits |
+| 1536 | 462 digits |
+| 2048 | 616 digits |
+
+Wider arithmetic, GEMM/QR, device preflight and memory planning are described in
+[wide-precision integration](docs/wide-precision.md). Transcendental APIs retain
+their separately validated 1024-bit limit.
 
 Capacity does not guarantee final numerical accuracy: cancellation and
 conditioning may require guard precision. The separate binary exponent ranges

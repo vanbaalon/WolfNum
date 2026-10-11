@@ -24,9 +24,9 @@ std::string message(NSError* e){return e?std::string([[e localizedDescription] U
 struct PolyParams {std::uint32_t count,terms,points_per_set;};
 struct NormParams {std::uint32_t segments,length,blocks;};
 enum Kind : std::uint32_t {status_kind=0,inf_kind=1,max_kind=2,scan_kind=3,sum_kind=4,ratio_kind=5};
-constexpr std::size_t tree_group=128; // TG in numerics.metal
+constexpr std::size_t tree_group(int bits){return bits>1920?64:128;} // TG in numerics.metal
 std::size_t up(std::size_t x,std::size_t m){return (x+m-1)/m*m;}
-void check_bits(int bits){if(bits<64||bits>1024||bits%32)throw std::invalid_argument("bits must be a multiple of 32 in [64,1024]");}
+void check_bits(int bits){if(bits<64||bits>2048||bits%32)throw std::invalid_argument("bits must be a multiple of 32 in [64,2048]");}
 // Validated polynomial shape: number of coefficient sets.
 std::size_t poly_sets(const Polynomial& s,unsigned order){
     if(order>2)throw std::invalid_argument("poly_eval_jet: order must be at most 2");
@@ -98,7 +98,7 @@ struct Numerics::Impl {
         if(L){
             auto first=pipeline(bits,"norm_first",1,flags|(std::uint32_t(kind==sum_kind?scan_kind:kind)<<1));
             // Tree threadgroups: a power of two in [32, 128], within the pipeline limit (fixed tree; see docs/numerics.md).
-            auto group_size=[&](id<MTLComputePipelineState> p,std::size_t len){std::size_t cap=std::min<std::size_t>(tree_group,p.maxTotalThreadsPerThreadgroup),t=32;
+            auto group_size=[&](id<MTLComputePipelineState> p,std::size_t len){std::size_t cap=std::min<std::size_t>(tree_group(bits),p.maxTotalThreadsPerThreadgroup),t=32;
                 while(t<len&&2*t<=cap)t*=2;if(t>cap)throw std::runtime_error("norm: pipeline threadgroup limit below one SIMD group");return t;};
             auto pass_first=[&](id<MTLComputePipelineState> p,bool output){
                 std::size_t t=group_size(p,L),blocks=(L+t-1)/t;NormParams params{std::uint32_t(S),std::uint32_t(L),std::uint32_t(blocks)};

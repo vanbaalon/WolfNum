@@ -43,7 +43,7 @@ constant bool nm_complex=(nm_flags&1)!=0;
 constant uint nm_kind=nm_flags>>1;
 constant bool nm_tree=nm_kind==1||nm_kind==2||nm_kind==4||nm_kind==5;
 constant bool nm_sum=nm_kind==4;
-constant uint TG=128; // largest threadgroup of the tree passes (power of two)
+constant uint TG=LF_BITS>1920?64:128; // largest threadgroup of the tree passes (power of two)
 struct NormParams { uint segments,length,blocks; };
 inline Number<N> absolute(Number<N> a){if(a.sign)a.sign=1;return a;}
 // RN(a^2) through the schoolbook product: core square() (symmetric on Metal at 384 bits) returned wrong values for
@@ -85,7 +85,14 @@ inline Number<N> ratio(Number<N> a,Number<N> b,Number<N> s,thread word& st){
 inline void reduce_block(threadgroup Number<N>* tk,threadgroup uint* ti,uint lid,uint T,uint m){
     for(uint w=1;w<T;w<<=1){
         if(lid%(2*w)==0&&lid+w<m){Number<N> a=tk[lid],b=tk[lid+w];
-            if(nm_sum)tk[lid]=add(a,b);else if(magnitude_compare(b,a)>0){tk[lid]=b;ti[lid]=ti[lid+w];}}
+            if(nm_sum){
+#if LF_BITS > 1024
+                Number<N> one=zero<N>(),z=one;one.sign=1;one.limb[N-1]=0x80000000u;
+                tk[lid]=dot2_add_rolled(one,a,one,b,z);
+#else
+                tk[lid]=add(a,b);
+#endif
+            }else if(magnitude_compare(b,a)>0){tk[lid]=b;ti[lid]=ti[lid+w];}}
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }

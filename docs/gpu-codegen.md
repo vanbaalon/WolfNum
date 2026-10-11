@@ -270,3 +270,34 @@ library passes 26/26 CTest suites and 19/19 GPU suites under shader validation.
 Additional valid/status normal-equation and negative-power sweeps pass at all widths.
 The exact compiler defect and the necessity of each part of the workaround have not
 been isolated. Do not infer correctness of another kernel from this result.
+
+
+## Wide algebra kernels (1056–2048 bits)
+
+Extending the existing private-array kernels beyond 1024 bits exposed compiler
+failures in composed arithmetic. Loop rolling alone was insufficient for the
+engine's complex division; keeping `add`, `mul` and `div` out of line on Metal
+above 1024 bits, with rolled shared-core loops, passed the wider arithmetic probes.
+Making every helper out of line instead interrupted the Metal compiler service.
+Both engine compilation defines (`MP_BITS` and `LF_BITS`) must identify the same
+width so these rules apply to the engine as well as the algebra shaders.
+
+The private batched namespace keeps its historical 33-word layout through 1024
+bits and uses the logical limb count at wider precisions. In composed complex
+GEMM, nested sums of newly computed wide products gave incorrect results even
+with rolled loops. The wide path keeps the individually rounded products and
+performs the following component sum and accumulator addition with the exact
+window implementation (`dot2_add_rolled`, using factors one and zero). This
+preserves the composed rounding contract. The same exact-window addition is used
+for wide complex arithmetic and norm sum trees: repeated out-of-line add results
+in those contexts also failed, including with shader instrumentation. Fused mode retains its existing
+exact two-product-plus-accumulator contract. Test both modes with cached operands,
+dense batches and widely separated exponents before changing this layout.
+
+Cooperative tree reduction scratch exceeds the available threadgroup memory
+at these widths. Wide tree sums use the existing global-memory tree instead;
+reduction prewarming must omit the cooperative pipelines above 1024 bits.
+The Numerics norm tree uses 64 lanes above 1920 bits to keep its key/index arrays
+within 32 KiB of threadgroup memory. Wide casts use a 65-word source workspace, and host exact products use `2*N`
+words rather than the former fixed 64-word arrays. Transcendental compilation
+continues to use its separately validated widths and 1024-bit public limit.

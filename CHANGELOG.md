@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Extend storage, bridges, arithmetic, dense/batched GEMM and real/complex QR
+  from 1024 to 2048 bits at every 32-bit step. Wide Metal arithmetic uses rolled
+  loops; exact host products and private batched/cast scratch accommodate the
+  larger limb counts. Exact-window additions preserve wide composed complex
+  arithmetic and norm-tree roundings; wider reductions respect threadgroup
+  memory limits. Existing 64–1024-bit contracts remain unchanged;
+  transcendental functions retain their 1024-bit validation limit.
+- Add allocation-free structural width/shape queries in `capabilities.hpp` and
+  `Engine::device_limits`, including overflow, indexing, stride and device buffer
+  checks. Document QR matrix memory, reusable-factor iterative refinement and
+  fallback diagnostics in `docs/wide-precision.md`.
+- Validate all 32 new widths against MPFR/MPC for arithmetic, exact GEMM, cached
+  complex GEMM, real/complex QR, casts and tiny norms. Key widths 1056, 1152,
+  1536 and 2048 also pass Metal shader validation; the strong-coupling adapter
+  passes small end-to-end products and tiny-pivot solves at 1152/1536/2048 bits.
+  The complete build, 8 CPU tests and 20 GPU/integration regressions pass.
+
 - Retained an uninstalled exact batched real/complex 4x4 prototype and complete
   checked baseline: all 31 supported widths, small/dense/supplement/multi-call
   normal/Metal checks, 26 normal/19 Metal suites, 24 four-contract comparisons

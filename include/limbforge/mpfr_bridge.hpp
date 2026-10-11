@@ -20,7 +20,7 @@ namespace limbforge {
 namespace detail {
 // Reference implementations through mpz; the fast paths below must agree with them bit for bit (tests/test_bridge.cpp).
 template<int Bits> inline Float<Bits> from_mpfr_slow(mpfr_srcptr input) {
-    static_assert(Bits>=64&&Bits<=1024&&Bits%32==0,"unsupported precision");
+    static_assert(Bits>=64&&Bits<=2048&&Bits%32==0,"unsupported precision");
     if(!mpfr_number_p(input))return zero<Bits/32>(invalid);
     if(mpfr_zero_p(input))return zero<Bits/32>();
     mpfr_t x;mpfr_init2(x,Bits);mpfr_set(x,input,MPFR_RNDN);
@@ -53,7 +53,7 @@ inline std::size_t significand_words(mpfr_prec_t p){return 2*((std::size_t(p)+63
 // from_mpfr_slow including the inexact flag. Inputs outside the current MPFR range, a carry past emax, or a range
 // that cannot hold the slow path's integer scaling take the slow path.
 template<int Bits> inline Float<Bits> from_mpfr_fast(mpfr_srcptr input,Range range) {
-    static_assert(Bits>=64&&Bits<=1024&&Bits%32==0,"unsupported precision");
+    static_assert(Bits>=64&&Bits<=2048&&Bits%32==0,"unsupported precision");
     constexpr std::size_t N=Bits/32;
     if(!direct_limbs||!mpfr_regular_p(input))return from_mpfr_slow<Bits>(input);
     mpfr_exp_t e=mpfr_get_exp(input);
@@ -146,13 +146,13 @@ template<int Bits> inline void to_mpc_array(mpc_t* out,const Complex<Bits/32>* i
 // Runtime-width bridge. Buffers contain the same Float<bits>/Complex<bits/32> structs as the typed API;
 // caller-provided byte storage needs bridge_element_bytes(bits, complex)*count bytes. No alignment required.
 inline std::size_t bridge_element_bytes(int bits,bool complex=false){
-    if(bits<64||bits>1024||bits%32)throw std::invalid_argument("bridge bits must be a multiple of 32 in [64,1024]");
+    if(bits<64||bits>2048||bits%32)throw std::invalid_argument("bridge bits must be a multiple of 32 in [64,2048]");
     return std::size_t(bits/8+12)*(complex?2:1);
 }
 namespace detail {
 template<int Bits=64,class F> inline void bridge_width(int bits,F&& f){
     if(bits==Bits){f(std::integral_constant<int,Bits>{});return;}
-    if constexpr(Bits<1024)bridge_width<Bits+32>(bits,f);
+    if constexpr(Bits<2048)bridge_width<Bits+32>(bits,f);
 }
 }
 namespace detail {

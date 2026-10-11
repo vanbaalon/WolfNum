@@ -73,7 +73,7 @@ chunk's exception after all chunks finish; other chunks may already be written.
 before writing. The MPC functions appear when `<mpc.h>` is on the include path,
 need no libmpc symbols, and are disabled by `LIMBFORGE_NO_MPC`.
 
-Runtime-width scalar and array overloads accept `bits` in [64,1024], divisible by 32.
+Runtime-width scalar and array overloads accept `bits` in [64,2048], divisible by 32.
 `bridge_element_bytes(bits,complex)` gives the packed element size; provide sufficient
 capacity. Unaligned byte storage is supported by memcpy. Rounding, statuses, worker selection
 and error behavior match the typed bridge. External inline MPC import requires source precision
@@ -420,7 +420,7 @@ la.report();                                   // bands, fallbacks, moduli and s
 ```
 
 Matrices are host arrays, row-major, with elements `Float<bits>` (`Number<bits/32>`, `bits/8 + 12`
-bytes), and `bits` a multiple of 32 in [64, 1024]. C must not overlap A or B. With `lower_only`,
+bytes), and `bits` a multiple of 32 in [64, 2048]. C must not overlap A or B. With `lower_only`,
 SYRK writes `C[i][j]` for `i >= j` and leaves the rest of C untouched; otherwise it writes the full
 symmetric matrix. The GPU uses page-aligned inputs and outputs in place (no copy). The call returns
 after the GPU has finished.
@@ -946,6 +946,9 @@ Open: the on-device threshold comparison (it fits in the finish pass, so the hos
 `info`).
 
 ## QR factorization and least squares
+
+Widths through 2048 bits, reusable-factor refinement, device preflight and
+QR memory/indexing limits: [wide-precision integration](wide-precision.md).
 
 ```cpp
 QROptions o;                                       // FactorOptions (block = 32, host_macs, solve_host_macs, gpu) + rank_bits, pivot

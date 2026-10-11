@@ -1,0 +1,101 @@
+--- a/cpp/include/sc_gpu.hpp
++++ b/cpp/include/sc_gpu.hpp
+@@ -2,7 +2,7 @@
+ // enabled at run time with SC_GPU=1. Every call falls back to the CPU path (returns false) when disabled or on any error.
+ //   cgemm     C (m x n) = A (m x k) B (k x n), complex, row-major vectors of C   -- precompute kernel products, F's matrix products
+ //   qr_solve  x = A^-1 b for real square A (the Newton step), Householder QR of WolfNum (deterministic, exact dot products)
+-// Widths: the working precision rounded up to a multiple of 32 bits, 64..1024.
++// Widths: the working precision rounded up to a multiple of 32 bits, 64..2048 with the wider WolfNum API; legacy releases retain 64..1024.
+ #pragma once
+ #include "refio.hpp"
+ #include <atomic>
+@@ -15,6 +15,10 @@
+ #include <map>
+ #include <memory>
+ #include <limbforge/mpfr_bridge.hpp>
++#if __has_include(<limbforge/capabilities.hpp>)
++#include <limbforge/capabilities.hpp>
++#define SC_WOLFNUM_WIDE_API 1
++#endif
+ #endif
+ 
+ namespace sc { namespace gpu {
+@@ -33,11 +37,27 @@
+   par_for(n, thr, [&](int i) { try { fn(i); } catch (...) { std::lock_guard<std::mutex> g(lk); if (!err) err = std::current_exception(); } });
+   if (err) std::rethrow_exception(err);
+ }
+-#define SC_LF_WIDTHS(X) X(64) X(96) X(128) X(160) X(192) X(224) X(256) X(288) X(320) X(352) X(384) X(416) X(448) X(480) X(512) X(544) X(576) X(608) X(640) X(672) X(704) X(736) X(768) X(800) X(832) X(864) X(896) X(928) X(960) X(992) X(1024)
++#ifdef SC_WOLFNUM_WIDE_API
++#define SC_LF_WIDE_WIDTHS(X) X(1056) X(1088) X(1120) X(1152) X(1184) X(1216) X(1248) X(1280) X(1312) X(1344) X(1376) X(1408) X(1440) X(1472) X(1504) X(1536) X(1568) X(1600) X(1632) X(1664) X(1696) X(1728) X(1760) X(1792) X(1824) X(1856) X(1888) X(1920) X(1952) X(1984) X(2016) X(2048)
++#else
++#define SC_LF_WIDE_WIDTHS(X)
++#endif
++#ifndef SC_LF_MAXBITS
++#define SC_LF_MAXBITS 1024
++#endif
++#if SC_LF_MAXBITS > 1024
++#define SC_LF_WIDTHS(X) X(64) X(96) X(128) X(160) X(192) X(224) X(256) X(288) X(320) X(352) X(384) X(416) X(448) X(480) X(512) X(544) X(576) X(608) X(640) X(672) X(704) X(736) X(768) X(800) X(832) X(864) X(896) X(928) X(960) X(992) X(1024) X(1056) X(1088) X(1120) X(1152) X(1184) X(1216) X(1248) X(1280) X(1312) X(1344) X(1376) X(1408) X(1440) X(1472) X(1504) X(1536) X(1568) X(1600) X(1632) X(1664) X(1696) X(1728) X(1760) X(1792) X(1824) X(1856) X(1888) X(1920) X(1952) X(1984) X(2016) X(2048)
++#else
++#define SC_LF_WIDTHS(X) X(64) X(96) X(128) X(160) X(192) X(224) X(256) X(288) X(320) X(352) X(384) X(416) X(448) X(480) X(512) X(544) X(576) X(608) X(640) X(672) X(704) X(736) X(768) X(800) X(832) X(864) X(896) X(928) X(960) X(992) X(1024) SC_LF_WIDE_WIDTHS(X)
++#endif
+ 
+ template <int B> bool cgemm_t(const Vec& A, size_t m, size_t k, const Vec& Bm, size_t n, Vec& Cm, int thr) {
+   try {
+     using F = limbforge::Float<B>; const long long t0 = nowns();
++#ifdef SC_WOLFNUM_WIDE_API
++    const auto support = limbforge::query_gemm_support(engine().device_limits(), B, 2 * m, n, 2 * k);
++    if (!support.supported) throw std::runtime_error("GEMM preflight: " + support.reason);
++#endif
+     std::vector<F> Ar(4 * m * k), Br(2 * k * n), Cr(2 * m * n);
+     safe_par_for((int)m, thr, [&](int i) { for (size_t q = 0; q < k; ++q) { const C& v = A[size_t(i) * k + q]; C nv = -v;
+       F re = limbforge::from_mpfr<B>(mpc_realref(v.v)), im = limbforge::from_mpfr<B>(mpc_imagref(v.v)), nim = limbforge::from_mpfr<B>(mpc_imagref(nv.v));
+@@ -58,6 +78,10 @@
+ template <int B> bool qr_solve_t(const Mat& A, const Vec& b, Vec& x, int thr) {
+   try {
+     using F = limbforge::Float<B>; const size_t n = A.size(); const long long t0 = nowns();
++#ifdef SC_WOLFNUM_WIDE_API
++    const auto support = limbforge::query_qr_support(engine().device_limits(), B, n, n);
++    if (!support.supported) throw std::runtime_error("QR preflight: " + support.reason);
++#endif
+     std::vector<F> Ar(n * n), br(n), xr(n);
+     safe_par_for((int)n, thr, [&](int i) { for (size_t j = 0; j < n; ++j) Ar[size_t(i) * n + j] = limbforge::from_mpfr<B>(mpc_realref(A[i][j].v));
+       br[i] = limbforge::from_mpfr<B>(mpc_realref(b[i].v)); });
+@@ -76,6 +100,11 @@
+ template <int B> bool bgemm_t(size_t count, size_t m, size_t k, size_t n, const Vec& A, const Vec* Bsrc, long key, Vec& Cm, int thr) {
+   try {
+     using T = limbforge::Complex<B / 32>; const long long t0 = nowns();
++#ifdef SC_WOLFNUM_WIDE_API
++    const limbforge::StridedGemm planned{count, m, n, k, m * k, k * n, m * n};
++    const auto support = limbforge::query_batched_gemm_support(engine().device_limits(), B, true, planned);
++    if (!support.supported) throw std::runtime_error("batched GEMM preflight: " + support.reason);
++#endif
+     static std::mutex cm; static std::map<std::pair<long, int>, std::shared_ptr<std::vector<T>>> cache;
+     std::shared_ptr<std::vector<T>> Bp;
+     { std::lock_guard<std::mutex> g(cm); auto it = cache.find({key, B}); if (it != cache.end()) Bp = it->second; }
+@@ -109,7 +138,7 @@
+ #define SC_CASE(B) case B: return cgemm_t<B>(A, m, k, Bm, n, Cm, thr);
+     SC_LF_WIDTHS(SC_CASE)
+ #undef SC_CASE
+-    default: return false;
++    default: { const std::invalid_argument error("unsupported GPU width " + std::to_string(bits()) + " bits"); warn("cgemm", error); return false; }
+   }
+ #else
+   (void)A; (void)m; (void)k; (void)Bm; (void)n; (void)Cm; (void)thr; return false;
+@@ -122,7 +151,7 @@
+ #define SC_CASE(B) case B: return qr_solve_t<B>(A, b, x, thr);
+     SC_LF_WIDTHS(SC_CASE)
+ #undef SC_CASE
+-    default: return false;
++    default: { const std::invalid_argument error("unsupported GPU width " + std::to_string(bits()) + " bits"); warn("QR solve", error); return false; }
+   }
+ #else
+   (void)A; (void)b; (void)x; (void)thr; return false;
+@@ -136,7 +165,7 @@
+ #define SC_CASE(B) case B: return bgemm_t<B>(count, m, k, n, A, Bsrc, key, Cm, thr);
+     SC_LF_WIDTHS(SC_CASE)
+ #undef SC_CASE
+-    default: return false;
++    default: { const std::invalid_argument error("unsupported GPU width " + std::to_string(bits()) + " bits"); warn("batched gemm", error); return false; }
+   }
+ #else
+   (void)count; (void)m; (void)k; (void)n; (void)A; (void)Bsrc; (void)key; (void)Cm; (void)thr; return false;

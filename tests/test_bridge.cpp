@@ -177,7 +177,7 @@ int main(){
 #else
         std::cout<<"MPC not found: mpc_t checks skipped"<<std::endl;
 #endif
-        test_all(std::make_integer_sequence<int,31>{});
-        std::cout<<checks<<" bridge checks passed at 31 precisions"<<std::endl;return 0;
+        test_all(std::make_integer_sequence<int,63>{});
+        std::cout<<checks<<" bridge checks passed at 63 precisions"<<std::endl;return 0;
     }catch(const std::exception& e){std::cerr<<"FAILED: "<<e.what()<<std::endl;return 1;}
 }

@@ -114,10 +114,10 @@ using DotFn=void(*)(const void*,std::ptrdiff_t,const void*,std::ptrdiff_t,std::s
 template<int N> void dot_n(const void* a,std::ptrdiff_t sa,const void* b,std::ptrdiff_t sb,std::size_t K,void* out,bool sub){
     auto* o=static_cast<Number<N>*>(out);Number<N> c=*o;
     *o=exact_dot_add<N>(sub?&c:nullptr,sub,static_cast<const Number<N>*>(a),sa,static_cast<const Number<N>*>(b),sb,K);}
-template<int N> void dot_table(DotFn* t){t[N]=dot_n<N>;if constexpr(N<32)dot_table<N+1>(t);}
-DotFn dot_function(int words){static DotFn table[33]={};if(!table[2])dot_table<2>(table);return table[words];}
-// f(std::integral_constant<int, words>) for words in [2, 32].
-template<int N=2,class F> auto by_words(int words,F&& f){if constexpr(N<32){if(words!=N)return by_words<N+1>(words,f);}return f(std::integral_constant<int,N>{});}
+template<int N> void dot_table(DotFn* t){t[N]=dot_n<N>;if constexpr(N<64)dot_table<N+1>(t);}
+DotFn dot_function(int words){static DotFn table[65]={};if(!table[2])dot_table<2>(table);return table[words];}
+// f(std::integral_constant<int, words>) for words in [2, 64].
+template<int N=2,class F> auto by_words(int words,F&& f){if constexpr(N<64){if(words!=N)return by_words<N+1>(words,f);}return f(std::integral_constant<int,N>{});}
 }
 // Factor storage: zeroed, page-aligned and a whole number of pages, so the GPU uses it in place (wrap).
 namespace detail {
@@ -283,7 +283,7 @@ LinalgWorkspaces Linalg::release_workspaces(){LinalgWorkspaces w;for(auto& e:imp
             pool->clear();}
         impl->by_batch.clear();}
     return w;}
-static void check_bits(int bits){if(bits<64||bits>1024||bits%32)throw std::invalid_argument("bits must be a multiple of 32 in [64,1024]");}
+static void check_bits(int bits){if(bits<64||bits>2048||bits%32)throw std::invalid_argument("bits must be a multiple of 32 in [64,2048]");}
 namespace {
 void validate_prewarm(const LinalgPrewarm& r){for(int bits:r.bits)check_bits(bits);for(auto k:r.inner_sizes)if(k>max_k)throw std::invalid_argument("linalg prewarm: resident K exceeds 65472");}
 void prepare(const std::shared_ptr<LinalgKernelCache>& cache,const LinalgPrewarm& r){@autoreleasepool{
@@ -507,7 +507,7 @@ template<int N> void part_dot(Part& p,const Number<N>* a,std::ptrdiff_t sa,const
     if(p.status||!p.terms)return;
     int logc=0;while((std::size_t(1)<<logc)<p.terms)++logc;
     const long need=p.hi-p.lo+64*N+logc+1;if(need>32L*(part_cap-2)){p.wide=true;return;}
-    p.words=int(need/32)+2;std::fill(p.pos,p.pos+p.words,0);std::fill(p.neg,p.neg+p.words,0);word t[64];
+    p.words=int(need/32)+2;std::fill(p.pos,p.pos+p.words,0);std::fill(p.neg,p.neg+p.words,0);word t[2*N];
     for(std::size_t k=0;k<K;++k){const auto &x=a[std::ptrdiff_t(k)*sa],&y=b[std::ptrdiff_t(k)*sb];if(!x.sign||!y.sign)continue;
         mantissa_product<N>(x,y,t);detail::add_shifted(x.sign==y.sign?p.pos:p.neg,t,2*N,long(x.exponent)+y.exponent-p.lo);}
 }
@@ -550,7 +550,7 @@ template<int N> int compare_magnitude(const Number<N>& a,const Number<N>& b){
 // (magnitude words at exponent sum lo). Requires every x_r 2^-e in range (scaled() without a status).
 template<int N> Number<N> reflector_norm(const std::vector<word>& S,long lo,const Number<N>& x0,const Number<N>& v0,long e){
     const long sv=2L*v0.exponent,sx=x0.sign?2L*x0.exponent:sv,low=std::min({lo,sv,sx});
-    std::vector<word> acc(std::max(S.size()+std::size_t((lo-low)/32),std::size_t((std::max(sv,sx)-low)/32)+2*N)+3,0);word t[64];
+    std::vector<word> acc(std::max(S.size()+std::size_t((lo-low)/32),std::size_t((std::max(sv,sx)-low)/32)+2*N)+3,0);word t[2*N];
     detail::accumulate(acc,S.data(),int(S.size()),lo-low,1);mantissa_product<N>(v0,v0,t);detail::accumulate(acc,t,2*N,sv-low,1);
     if(x0.sign){mantissa_product<N>(x0,x0,t);detail::accumulate(acc,t,2*N,sx-low,-1);}
     return detail::pack_words<N>(acc,low-2*(32*N-1)-2*e,1,ok);
@@ -611,7 +611,7 @@ template<int N> void Linalg::Impl::qr_n(const Number<N>* A,std::size_t m,std::si
     // Pivoting: W row c of the trailing columns [a, e): Wb[c*n+k] = P(v_j, a_k) over local rows [c, mr) of the block-start
     // columns (Wk, read by rows), each column in an exact window anchored at the product of the exponent ranges (else exact_dot).
     auto w_tile=[&](std::size_t k0,std::size_t mr,std::size_t c,std::size_t a,std::size_t e,const T* vc,Range vr,int logl){
-        word acc[TW][2][part_cap];long lo[TW];int words[TW];word status[TW],tw[64];
+        word acc[TW][2][part_cap];long lo[TW];int words[TW];word status[TW],tw[2*N];
         for(std::size_t k=a;k<e;++k){const std::size_t i=k-a;status[i]=0;words[i]=0;lo[i]=0;if(vr.lo>vr.hi||crange[k].lo>crange[k].hi)continue;
             lo[i]=vr.lo+crange[k].lo;const long need=vr.hi+crange[k].hi-lo[i]+64*N+logl+1;
             if(need>32L*(part_cap-2)){words[i]=-1;continue;}words[i]=int(need/32)+2;std::fill(acc[i][0],acc[i][0]+words[i],0);std::fill(acc[i][1],acc[i][1]+words[i],0);}
@@ -688,7 +688,7 @@ template<int N> void Linalg::Impl::qr_n(const Number<N>* A,std::size_t m,std::si
                     if(scale_rows)for(std::size_t r=std::max(r0,c+1);r<r1;++r)vc[r]=scaled(x[r],e);
                     for(std::size_t u=0;u<ndots;++u){if(dwords[u]<0)continue;Acc& g=ac[u];
                         if(!g.used){g.used=true;g.status=0;std::fill(g.pos,g.pos+dwords[u],0);std::fill(g.neg,g.neg+dwords[u],0);}
-                        const T* pa=u<c?Vt.data()+u*mr:vc;const T* pb=u<c?vc:Pt.data()+(u+1)*mr;word tw[64];
+                        const T* pa=u<c?Vt.data()+u*mr:vc;const T* pb=u<c?vc:Pt.data()+(u+1)*mr;word tw[2*N];
                         for(std::size_t r=r0;r<r1;++r){const T &xa=pa[r],&xb=pb[r];const word st=xa.status|xb.status;g.status|=st;
                             if(st||!xa.sign||!xb.sign)continue;
                             mantissa_product<N>(xa,xb,tw);detail::add_shifted(xa.sign==xb.sign?g.pos:g.neg,tw,2*N,long(xa.exponent)+xb.exponent-dlo[u]);}}}});

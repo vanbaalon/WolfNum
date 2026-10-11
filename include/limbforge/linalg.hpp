@@ -288,7 +288,7 @@ template<int N> Number<N> exact_dot_add(const Number<N>* c,bool subtract,const N
     // Common case: all terms fit one exact accumulator pair (positive and negative parts), one rounding of the difference.
     {exponent_type hi=t[0].scale,lo=t[0].scale;for(std::size_t i=1;i<count;++i){hi=std::max(hi,t[i].scale);lo=std::min(lo,t[i].scale);}
      int logc=0;while((std::size_t(1)<<logc)<count)++logc;constexpr std::size_t cap=256;const exponent_type need=hi-lo+64*N+logc+1;
-     if(need<=32*exponent_type(cap-2)){const std::size_t W=std::size_t(need/32)+2;word pos[cap],neg[cap],p[64];std::fill(pos,pos+W,0);std::fill(neg,neg+W,0);
+     if(need<=32*exponent_type(cap-2)){const std::size_t W=std::size_t(need/32)+2;word pos[cap],neg[cap],p[2*N];std::fill(pos,pos+W,0);std::fill(neg,neg+W,0);
         for(std::size_t q=0;q<count;++q){int words;int sign=term(t[q].k,p,words);detail::add_shifted(sign>0?pos:neg,p,words,long(t[q].scale-lo));}
         int cmp=0;for(std::size_t i=W;i-->0;)if(pos[i]!=neg[i]){cmp=pos[i]>neg[i]?1:-1;break;}
         if(!cmp)return zero<N>();
@@ -302,7 +302,7 @@ template<int N> Number<N> exact_dot_add(const Number<N>* c,bool subtract,const N
     for(std::size_t i=0;i<count&&sums.size()<2;){
         std::size_t j=i+1;exponent_type low=t[i].scale;
         while(j<count&&t[j].scale+width-1+gap>=low){low=std::min(low,t[j].scale);++j;}
-        std::vector<word> acc(std::size_t((t[i].scale+width-low)/32+3),0);word p[64];
+        std::vector<word> acc(std::size_t((t[i].scale+width-low)/32+3),0);word p[2*N];
         for(std::size_t q=i;q<j;++q){int words;int sign=term(t[q].k,p,words);detail::accumulate(acc,p,words,long(t[q].scale-low),sign);}
         int sign=1;if(acc.back()>>31){sign=-1;dword cy=1;for(auto& v:acc){dword z=dword(word(~v))+cy;v=word(z);cy=z>>32;}}
         if(std::any_of(acc.begin(),acc.end(),[](word v){return v!=0;}))sums.push_back({sign,low,std::move(acc)});

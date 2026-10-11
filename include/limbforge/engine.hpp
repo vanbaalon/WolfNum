@@ -26,6 +26,8 @@ inline std::size_t broadcast_elements(std::size_t count,Broadcast b){
 // 0 selects the default policy. cooperative_recurrence spreads each trajectory over 4/8/16/32 SIMD lanes
 // for small and mid-size counts (bit-identical; docs/experiments.md, round 41-L4b).
 struct EngineOptions { unsigned threads_per_threadgroup=0; bool cooperative_reductions=true; bool cooperative_recurrence=true; };
+// Device allocation limits; the working-set size is advisory, shared with other applications.
+struct DeviceLimits {std::size_t max_buffer_bytes=0,recommended_working_set_bytes=0,host_page_bytes=0;};
 struct PipelineInfo { unsigned simd_width,max_threads,threads_per_threadgroup; };
 // Segmented dot products: out[i] = sum_{k<length} a[i*length+k] * b[i*length+k] (or b[k] when
 // shared_right), as a sequential fma/cfma chain from k = 0 (docs/numerics.md).
@@ -64,8 +66,8 @@ struct Internal; // src/engine_internal.hpp: Metal objects behind Engine/Command
 void* mapped(const std::shared_ptr<BufferStorage>&);
 void transfer(const std::shared_ptr<BufferStorage>&,void*,std::size_t,bool);
 template<class T> struct Format;
-template<int N> struct Format<Number<N>> {static_assert(N>=2&&N<=32,"unsupported precision");static constexpr int bits=32*N;static constexpr bool complex=false;};
-template<int N> struct Format<Complex<N>> {static_assert(N>=2&&N<=32,"unsupported precision");static constexpr int bits=32*N;static constexpr bool complex=true;};
+template<int N> struct Format<Number<N>> {static_assert(N>=2&&N<=64,"unsupported precision");static constexpr int bits=32*N;static constexpr bool complex=false;};
+template<int N> struct Format<Complex<N>> {static_assert(N>=2&&N<=64,"unsupported precision");static constexpr int bits=32*N;static constexpr bool complex=true;};
 // Status words (e.g. batched 4x4 pivot statuses); not an arithmetic format.
 template<> struct Format<std::uint32_t> {static constexpr int bits=0;static constexpr bool complex=false;};
 template<> struct Format<std::int32_t> {static constexpr int bits=0;static constexpr bool complex=false;};
@@ -186,6 +188,7 @@ public:
     explicit Engine(EngineOptions options={}); ~Engine();
     Engine(const Engine&)=delete; Engine& operator=(const Engine&)=delete;
     std::string device_name() const;
+    DeviceLimits device_limits() const;
     // Compile the requested pipelines now; prewarm_async does it on a background thread while this
     // Engine stays usable (the pipeline cache is thread-safe). Errors surface from the future.
     void prewarm(const Prewarm& request);
@@ -197,7 +200,7 @@ public:
         return Buffer<T>(allocate(count*sizeof(T)),count);
     }
     CommandBatch batch();
-    // Bits must be a multiple of 32 in [64,1024]. Binary struct layouts above.
+    // Bits must be a multiple of 32 in [64,2048]. Binary struct layouts above.
     // b_index: broadcast read of b (b then holds broadcast_elements(count, b_index) values).
     Timing run(int bits,Operation op,const void* a,const void* b,void* out,std::size_t count,Broadcast b_index={});
     Timing run_unary(int bits,Operation op,const void* a,void* out,std::size_t count);

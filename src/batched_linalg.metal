@@ -152,7 +152,17 @@ kernel void batch_private_complex(device const Complex<N>* A [[buffer(0)]],devic
         PrivateNumber bi=batch_private_load(part?B[t*p.sb+k*p.n+col].re:B[t*p.sb+k*p.n+col].im);
         if(batch_fused)sum=limbforge_batched_private::dot2_add_rolled(ar,br,part?ai:limbforge_batched_private::negate(ai),bi,sum);
         else {PrivateNumber x=limbforge_batched_private::mul<N,true>(ar,br),y=limbforge_batched_private::mul<N,true>(ai,bi);
-            sum=limbforge_batched_private::add(part?limbforge_batched_private::add(x,y):limbforge_batched_private::sub(x,y),sum);}
+#if LF_BITS > 1024
+            // Wide composed products retain all four primitive roundings. The exact-window sums avoid
+            // Metal's miscompilation of nested add/sub on freshly computed wide products (see gpu-codegen.md).
+            if(!part)y=limbforge_batched_private::negate(y);
+            PrivateNumber one=limbforge_batched_private::zero<N>(),z=one;one.sign=1;one.limb[N-1]=0x80000000u;
+            PrivateNumber value=limbforge_batched_private::dot2_add_rolled(one,x,one,y,z);
+            sum=limbforge_batched_private::dot2_add_rolled(one,value,z,z,sum);
+#else
+            sum=limbforge_batched_private::add(part?limbforge_batched_private::add(x,y):limbforge_batched_private::sub(x,y),sum);
+#endif
+        }
     }
     if(p.flags&2)sum=limbforge_batched_private::negate(sum);batch_private_store(C[o],sum);
 }

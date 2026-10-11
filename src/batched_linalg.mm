@@ -18,7 +18,7 @@ using I=detail::Internal;using O=detail::Operand;using S=std::shared_ptr<detail:
 struct Params {std::uint64_t count,m,n,k,sa,sb,sc;std::int32_t n0;std::uint32_t flags;std::uint64_t row_offset=0;};
 std::size_t mul_size(std::size_t a,std::size_t b){if(b&&a>std::size_t(-1)/b)throw std::invalid_argument("batched algebra: size overflow");return a*b;}
 std::size_t extent(std::size_t count,std::size_t stride,std::size_t matrix){if(!count||!matrix)return 0;auto n=mul_size(count-1,stride);if(matrix>std::size_t(-1)-n)throw std::invalid_argument("batched algebra: stride overflow");return n+matrix;}
-void bits_ok(int bits){if(bits<64||bits>1024||bits%32)throw std::invalid_argument("bits must be a multiple of 32 in [64,1024]");}
+void bits_ok(int bits){if(bits<64||bits>2048||bits%32)throw std::invalid_argument("bits must be a multiple of 32 in [64,2048]");}
 void grid_ok(std::size_t n){if(n>std::size_t(UINT32_MAX))throw std::invalid_argument("batched algebra: grid exceeds 32-bit indexing");}
 void size_ok(O o,std::size_t n){if(o.size<n)throw std::invalid_argument("batched algebra: undersized buffer");}
 void distinct(O out,std::initializer_list<O> in){for(auto a:in)if(out.storage&&out.storage==a.storage)throw std::invalid_argument("batched algebra: output aliases an input");}

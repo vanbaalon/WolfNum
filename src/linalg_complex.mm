@@ -37,7 +37,7 @@ namespace {
 using Clock=std::chrono::steady_clock;
 double since(Clock::time_point t){return std::chrono::duration<double>(Clock::now()-t).count();}
 using Hooks=detail::LinalgHooks;
-template<int N=2,class F> auto words_of(int words,F&& f){if constexpr(N<32){if(words!=N)return words_of<N+1>(words,f);}return f(std::integral_constant<int,N>{});}
+template<int N=2,class F> auto words_of(int words,F&& f){if constexpr(N<64){if(words!=N)return words_of<N+1>(words,f);}return f(std::integral_constant<int,N>{});}
 template<int N> using Cx=Complex<N>;
 // A contiguous complex vector as the interleaved real sequence (re_0, im_0, re_1, ...).
 template<int N> const Number<N>* flat(const Cx<N>* p){return reinterpret_cast<const Number<N>*>(p);}
@@ -64,7 +64,7 @@ struct Range {long lo,hi;};
 // Exponent range of the nonzero, status-free entries of K reals.
 template<int N> Range range_of(const Number<N>* x,std::size_t K){Range g{LONG_MAX,LONG_MIN};for(std::size_t k=0;k<K;++k)if(x[k].sign&&!x[k].status){g.lo=std::min(g.lo,long(x[k].exponent));g.hi=std::max(g.hi,long(x[k].exponent));}return g;}
 // w += x*y exactly at exponent-sum anchor lo (the window is wide enough by construction).
-template<int N> void add_product(word* pos,word* neg,const Number<N>& x,const Number<N>& y,long lo){word t[64];detail::mantissa_mul<N>(x.limb,y.limb,t);
+template<int N> void add_product(word* pos,word* neg,const Number<N>& x,const Number<N>& y,long lo){word t[2*N];detail::mantissa_mul<N>(x.limb,y.limb,t);
     detail::add_shifted(x.sign==y.sign?pos:neg,t,2*N,long(x.exponent)+y.exponent-lo);}
 // Window of sum_k a[k] b[k] (k < K) anchored at its own lowest term: status OR, range of exponent sums, exact parts.
 template<int N> void window_dot(Window& w,const Number<N>* a,const Number<N>* b,std::size_t K){
@@ -102,7 +102,7 @@ template<int N> bool merge_windows(const Window* w,std::size_t count,Number<N>& 
 // exact S = |alpha|^2 + sum_{r>0} |x_r|^2 (magnitude words at exponent sum lo); requires every scaled entry in range.
 template<int N> Number<N> reflector_norm(const std::vector<word>& S,long lo,const Number<N>& x0,const Number<N>& v0,long e){
     const long sv=2L*v0.exponent,sx=x0.sign?2L*x0.exponent:sv,low=std::min({lo,sv,sx});
-    std::vector<word> acc(std::max(S.size()+std::size_t((lo-low)/32),std::size_t((std::max(sv,sx)-low)/32)+2*N)+3,0);word t[64];
+    std::vector<word> acc(std::max(S.size()+std::size_t((lo-low)/32),std::size_t((std::max(sv,sx)-low)/32)+2*N)+3,0);word t[2*N];
     detail::accumulate(acc,S.data(),int(S.size()),lo-low,1);detail::mantissa_mul<N>(v0.limb,v0.limb,t);detail::accumulate(acc,t,2*N,sv-low,1);
     if(x0.sign){detail::mantissa_mul<N>(x0.limb,x0.limb,t);detail::accumulate(acc,t,2*N,sx-low,-1);}
     return detail::pack_words<N>(acc,low-2*(32*N-1)-2*e,1,ok);
@@ -338,7 +338,7 @@ template<int N> static Timing solve_n(const detail::ComplexQRData& f,const Cx<N>
     for(std::size_t i=0;i<n;++i)for(std::size_t c=0;c<nrhs;++c)X[f.perm[i]*nrhs+c]=i<p?Cx<N>{Xs[2*i*nrhs+c],Xs[(2*i+1)*nrhs+c]}:czero<N>();
     tm.wall_seconds=since(start);return tm;
 }
-static void check_bits(int bits){if(bits<64||bits>1024||bits%32)throw std::invalid_argument("bits must be a multiple of 32 in [64,1024]");}
+static void check_bits(int bits){if(bits<64||bits>2048||bits%32)throw std::invalid_argument("bits must be a multiple of 32 in [64,2048]");}
 // The embeddings double both dimensions (32-bit indexing of the real products).
 static void check_size(std::size_t n,std::size_t other){if(2*n>=46341||4*n*other>=(std::size_t(1)<<31))throw std::invalid_argument("matrix dimensions exceed 32-bit indexing");}
 ComplexQRFactor Linalg::factor_qr_complex(int bits,const void* A,std::size_t m,std::size_t n,const QROptions& o){
