@@ -68,10 +68,18 @@ inline uint reduce(int g,uint m){int r=g%int(m);return uint(r<0?r+int(m):r);}
 // (|sum| <= 2 Kp 2^14 < 2^31), kept in registers (cooperative tensors of one op, hence one layout), and residue_j =
 // (65536*G11 + 256*Gmid + G00) mod m written directly: no int32 planes in memory (round 40; before, three products and a
 // combine pass per modulus). st: element strides of the lcat, a1/a0 and rcat planes. Skips tiles above the diagonal (p.tri).
+// Triangular GEMM (p.lower without SYRK): skips tiles none of whose (row line, column line) pairs lies in the written triangle;
+// reconstruct skips those outputs before reading any residue. Members of a band are in line order, so the needed entries of a
+// band pair form a staircase and about half of the tiles are skipped.
 kernel void product_residue(device int8_t* lcat [[buffer(0)]],device int8_t* a1 [[buffer(1)]],device int8_t* a0 [[buffer(2)]],device int8_t* rcat [[buffer(3)]],
                             device ushort* res [[buffer(4)]],constant Params& p [[buffer(5)]],constant uint4& st [[buffer(6)]],
+                            device const Member* lband [[buffer(7)]],device const Member* rband [[buffer(8)]],
                             device const uint* moduli [[buffer(11)]],device const uint* recips [[buffer(12)]],uint3 tgid [[threadgroup_position_in_grid]]){
     if(p.tri&&int(tgid.y)*64+63<int(tgid.x)*32)return;
+    if(p.lower&&!p.both){int rlo=INT_MAX,rhi=INT_MIN,clo=INT_MAX,chi=INT_MIN; // uniform over the threadgroup
+        for(uint r=tgid.y*64;r<min(tgid.y*64+64,p.rows);++r){int l=lband[r].line;rlo=min(rlo,l);rhi=max(rhi,l);}
+        for(uint c=tgid.x*32;c<min(tgid.x*32+32,p.cols);++c){int l=rband[c].line;clo=min(clo,l);chi=max(chi,l);}
+        if(rlo>rhi||clo>chi||(p.lower==1?rhi<clo:rlo>chi))return;}
     const int M=int(p.Mp),Nn=int(p.Np),K=int(p.Kp);const ulong z=tgid.z;
     lcat+=z*st.x;a1+=z*st.y;a0+=z*st.y;rcat+=z*st.z;
     auto tL=tensor<device int8_t,dextents<int32_t,2>,tensor_inline>(lcat,dextents<int32_t,2>(2*K,M));

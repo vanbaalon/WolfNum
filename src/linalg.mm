@@ -469,7 +469,7 @@ Timing Linalg::Impl::run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,s
             [enc setBuffer:in_a offset:a_offset atIndex:0];[enc setBuffer:mem offset:0 atIndex:1];[enc setBuffer:lcat offset:0 atIndex:2];[enc setBuffer:a1 offset:0 atIndex:3];
             [enc setBuffer:a0 offset:0 atIndex:4];[enc setBuffer:rcat offset:0 atIndex:6];grid(kern.left,Kp,Mp,groups);
             if(!syrk){[enc setBuffer:in_b offset:b_offset atIndex:0];[enc setBuffer:mem offset:rbase*sizeof(Member) atIndex:1];[enc setBuffer:rcat offset:0 atIndex:2];grid(kern.right,Np,Kp,groups);}
-            [enc setComputePipelineState:kern.product_res];
+            [enc setComputePipelineState:kern.product_res];[enc setBuffer:mem offset:0 atIndex:7];[enc setBuffer:mem offset:rbase*sizeof(Member) atIndex:8];
             [enc setBuffer:lcat offset:0 atIndex:0];[enc setBuffer:a1 offset:0 atIndex:1];[enc setBuffer:a0 offset:0 atIndex:2];[enc setBuffer:rcat offset:0 atIndex:3];
             [enc setBuffer:res offset:0 atIndex:4];[enc setBytes:st length:16 atIndex:6];
             [enc dispatchThreadgroups:MTLSizeMake(Np/32,Mp/64,count) threadsPerThreadgroup:MTLSizeMake(kern.product_res.threadExecutionWidth*4,1,1)];
@@ -1116,6 +1116,7 @@ LinalgTicket Linalg::encode_product(CommandBatch& batch,int bits,bool syrk,bool 
                 [e setBuffer:plan offset:rec(2+t) atIndex:5];indirect(e,5+3*t,tile(kern.right));}
             {auto e=start(kern.product_res);common(e);[e setBuffer:lcat offset:0 atIndex:0];[e setBuffer:a1 offset:0 atIndex:1];[e setBuffer:a0 offset:0 atIndex:2];
                 [e setBuffer:rcat offset:0 atIndex:3];[e setBuffer:res offset:0 atIndex:4];[e setBuffer:plan offset:rec(2+t) atIndex:5];[e setBuffer:plan offset:rec(2+batches+pairs) atIndex:6];
+                [e setBuffer:lmem offset:0 atIndex:7];[e setBuffer:rmem offset:0 atIndex:8];
                 indirect(e,6+3*t,MTLSizeMake(kern.product_res.threadExecutionWidth*4,1,1));}
         }
         for(unsigned q=0;q<pairs;++q){auto e=start(rec_p);common(e);

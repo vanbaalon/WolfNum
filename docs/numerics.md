@@ -642,8 +642,12 @@ bit. Existing entry points and defaults are unchanged.
   the written entries are copied back. C must not overlap A or B.
 - **Triangles.** With `Triangle::lower` or `Triangle::upper` (square C), only outputs with
   `i >= j` or `i <= j` are computed and written. The rest of C, and every entry outside the view,
-  keeps its bits. The GPU skips reconstruction and host assembly of the other triangle. The int8
-  residue products still cover the full extended product, so GPU time does not halve.
+  keeps its bits. The GPU skips reconstruction and host assembly of the other triangle, and every
+  64 x 32 int8 residue tile whose row and column lines all lie outside it. Members of a band are in
+  line order, so each band-pair block needs only a staircase of tiles. Diagonal tiles and digit
+  extraction (O((m + n) k) per modulus) remain. At 256 bits, k = 256 and n = 1024 or 2048, on a
+  loaded M5 Max host, triangular calls took 0.57-0.60x the GPU time and 0.65-0.68x the wall time of
+  full calls (median of 5; single-band operands).
 - **`syr2k`.** For A and B (k x n), `syr2k` forms `A^T B + B^T A` (symmetric) or `A^T B - B^T A`
   (skew). With `transpose_a` it forms `A B^T ± B A^T` for A and B (n x k). It packs `[A; B]` and
   `[B; ±A]` once (O(nk)) and takes the exact 2k-term dot of each entry, so the update has one

@@ -8,6 +8,8 @@
   rank-2k updates with one rounding per entry, and multithreaded exact `negate_block`/`copy_block`
   and one-rounding `axpy_block`. Existing entry points, defaults and rounding are unchanged;
   internally, strided host views not in a resident buffer are now packed rather than rejected.
+  Triangular products also skip int8 residue tiles outside the triangle (0.57-0.60x the full GPU
+  time at 256 bits, k = 256, n = 1024/2048 on a loaded host).
   Validation: `tests/test_gemm_spec.cpp` (new) against MPFR at 256/1152 bits on GPU, forced-host
   and resident paths. Existing `linalg_gpu`, `gpu_required_gemm`, resident (`--quick`), Cholesky
   and QR tests pass.

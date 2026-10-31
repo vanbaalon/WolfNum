@@ -53,6 +53,9 @@ template<int B> void host_products(Linalg& la,const char* label,std::mt19937_64&
             la.gemm(B,c.A.data(),c.Bm.data(),c.m,c.n,c.k,C.data(),c.spec);
             const auto& r=la.report();require(la.options().force_fallback?!r.gpu_outputs:r.gpu_outputs&&r.multi_band_outputs&&r.fallback_outputs,"placement mix not exercised: gpu="+std::to_string(r.gpu_outputs)+" multi="+std::to_string(r.multi_band_outputs)+" fallback="+std::to_string(r.fallback_outputs));
             c.check(C,std::string(label)+" bits="+std::to_string(B)+" ta="+std::to_string(ta)+" tb="+std::to_string(tb)+" "+name(u)+" tri="+std::to_string(int(t)));}
+    // Several 64 x 32 residue tiles: off-triangle tiles are skipped (multi-band staircases included).
+    for(Triangle t:{Triangle::lower,Triangle::upper})for(bool ta:{false,true}){Case<B> c(150,150,24,ta,!ta,GemmUpdate::add,t,rng);auto C=c.C0;
+        la.gemm(B,c.A.data(),c.Bm.data(),c.m,c.n,c.k,C.data(),c.spec);c.check(C,std::string(label)+" multi-tile bits="+std::to_string(B)+" tri="+std::to_string(int(t)));}
     // The default spec is the plain gemm, bit for bit; K = 0 leaves an update unchanged and overwrites with zero.
     {auto A=matrix<B>(6,5,rng),Bm=matrix<B>(5,4,rng);std::vector<F<B>> C1(24),C2(24);
         la.gemm(B,false,A.data(),Bm.data(),6,4,5,C1.data());la.gemm(B,A.data(),Bm.data(),6,4,5,C2.data(),GemmSpec{});
@@ -86,8 +89,9 @@ template<int B> void utilities(Linalg& la,std::mt19937_64& rng){
 }
 template<int B> void resident(Engine& e,std::mt19937_64& rng){
     Linalg la(e);
-    for(GemmUpdate u:{GemmUpdate::overwrite,GemmUpdate::add,GemmUpdate::subtract})for(Triangle t:{Triangle::full,Triangle::upper})for(bool tb:{false,true}){
-        Case<B> c(9,9,11,u==GemmUpdate::add,tb,u,t,rng);
+    for(GemmUpdate u:{GemmUpdate::overwrite,GemmUpdate::add,GemmUpdate::subtract})for(Triangle t:{Triangle::full,Triangle::upper,Triangle::lower})for(bool tb:{false,true}){
+        const std::size_t size=t==Triangle::lower?150:9;  // lower: several residue tiles (off-triangle tiles skipped)
+        Case<B> c(size,size,11,u==GemmUpdate::add,tb,u,t,rng);
         auto Ab=e.make_buffer<F<B>>(c.A.size()),Bb=e.make_buffer<F<B>>(c.Bm.size()),Cb=e.make_buffer<F<B>>(c.C0.size());
         Ab.upload(c.A.data(),c.A.size());Bb.upload(c.Bm.data(),c.Bm.size());Cb.upload(c.C0.data(),c.C0.size());
         auto batch=e.batch();auto ticket=la.gemm(batch,Ab,Bb,c.m,c.n,c.k,Cb,c.spec);batch.submit().wait();require(ticket.resolved(),"resident ticket");

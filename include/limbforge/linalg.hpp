@@ -115,7 +115,7 @@ struct GemmSpec {
     std::size_t lda=0,ldb=0,ldc=0;                // row strides in elements of the stored row-major A, B and C; 0 = their column counts
     std::size_t a_offset=0,b_offset=0,c_offset=0; // first element of A, B and C, in elements from the pointer (or buffer start)
     GemmUpdate update=GemmUpdate::overwrite;
-    Triangle triangle=Triangle::full;             // m == n: only outputs i >= j (lower) or i <= j (upper) are computed and written
+    Triangle triangle=Triangle::full;             // m == n: only outputs i >= j (lower) or i <= j (upper) are computed and written (about half the GPU work)
     bool require_gpu=false;                       // host arrays: as gemm_gpu (host fallback throws before C changes); Buffer forms reject it
 };
 namespace detail { struct QRData; }
