@@ -13,6 +13,9 @@
   the update's host overhead in a Pfaffian (n = 4096, block 64) fell from 0.7–0.8 s to 0.1–0.3 s.
   The LU and Pfaffian panels run one parallel pass per column (step) instead of two, with the same
   operations: Pfaffian panel 0.89 → 0.63 s (n = 4096, block 64), real LU panel 17–19% shorter.
+  GPU updates `RN(c - x)` add the old entry inside the reconstructed integer's word window when it
+  fits, then round once (the general two-term sum otherwise): reconstruction 1.08 → 0.98 ns per
+  output (M = N = 4096, K = 64, 192 bits).
 
 - Add two-level blocking for Pfaffians (`EliminationOptions::inner_block`, opt-in, rounded up to even;
   previously rejected). Inner blocks are flushed into the panel as exact triangular products. An

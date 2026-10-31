@@ -105,9 +105,27 @@ kernel void product_residue(device int8_t* lcat [[buffer(0)]],device int8_t* a1 
 // SUB (pipeline specialisation): outputs are updates RN(c - x) (or RN(c + x) with p.add) of the old output c, for the exact
 // dot product x = sign * X * 2^scale, with one rounding (round_sum). A status on c gives zero with that status.
 constant bool SUB [[function_constant(0)]];
+// T (W words, two's complement) += or -= s (sw words) * 2^off.
+template<int W> inline void add_signed(thread word (&T)[W],thread const word* s,int sw,int off,bool neg){
+    const int w=off/32,b=off%32;ulong carry=0;
+    for(int k=0;k+w<W;++k){if(k>sw&&!carry)break;
+        word v=k<sw?s[k]<<b:0;if(b&&k>0&&k-1<sw)v|=s[k-1]>>(32-b);
+        if(!neg){ulong u=ulong(T[k+w])+v+carry;T[k+w]=uint(u);carry=u>>32;}
+        else{ulong u=ulong(v)+carry;uint o=T[k+w];T[k+w]=uint(ulong(o)-u);carry=ulong(o)<u;}}
+}
 template<int W> inline Number<N> rounded(thread const word (&X)[W],exponent_type scale,int sign,device const Number<N>& old,bool add){
     if(!SUB)return pack<N>(X,scale,sign,ok);
     Number<N> c=old;if(c.status)return zero<N>(c.status);
+    // Fast path when c and x fit one W-word window (the grid of whichever has the lower bits): the exact sum c + s x in two's
+    // complement, then one rounding (pack). The same value as round_sum, which handles every other case.
+    const int h=highest(X);
+    if(h>=0){const int sx=add?sign:-sign;if(!c.sign)return pack<N>(X,scale,sx,ok);
+        const exponent_type cl=exponent_type(c.exponent)-(32*N-1),lo=min(scale,cl),hi=max(scale+h,exponent_type(c.exponent));
+        if(hi-lo+3<=32*W){word T[W];for(int k=0;k<W;++k)T[k]=0;
+            word cm[N];for(int k=0;k<N;++k)cm[k]=c.limb[k];
+            add_signed(T,&X[0],h/32+1,int(scale-lo),sx<0);add_signed(T,&cm[0],N,int(cl-lo),c.sign<0);
+            int rs=1;if(T[W-1]>>31){ulong cy=1;for(int k=0;k<W;++k){const ulong t=ulong(~T[k])+cy;T[k]=uint(t);cy=t>>32;}rs=-1;}
+            return pack<N>(T,lo,rs,ok);}}
     Exact<W> x;for(int k=0;k<W;++k)x.w[k]=X[k];x.scale=scale;x.sign=highest(X)<0?0:add?sign:-sign;
     return round_sum(x,c);
 }
