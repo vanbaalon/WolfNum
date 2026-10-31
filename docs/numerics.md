@@ -1100,8 +1100,8 @@ la.pfaffian(bits, A, n, &pf_lead, o, nullptr, S); // S = R + Q^T P^-1 Q (full sk
   - For the Pfaffian of `[P Q; -Q^T R]` it is `R + Q^T P^-1 Q`, written with both triangles, and
     `out` is `Pf(P)`. `k` must be even.
 
-**Two-level blocking (LU only, opt-in).** `EliminationOptions::inner_block = ib` changes the LU sequence
-inside each block of `block` columns, so it is opt-in:
+**Two-level blocking (opt-in).** `EliminationOptions::inner_block = ib` changes the sequence inside each
+block of `block` columns, so it is opt-in. For LU:
 
 - **Panel:** columns are processed in inner blocks of `ib`. The lazy panel dots span the current inner
   block only. After each inner block, its U entries of the later panel columns are formed, and its
@@ -1115,21 +1115,55 @@ to `block` terms to at most `ib`, while the GPU trailing update keeps the large 
 `stop_at` and leading values work as before, and leading values still equal separate calls with the
 same options.
 
-The Pfaffian rejects `inner_block`: a symmetric exchange with an index outside the block would bring
-an unflushed column into the panel. Measured (complex LU, 192 bits, n = 2048, loaded host):
+Measured (complex LU, 192 bits, n = 2048, loaded host):
 
 | block | inner_block | wall | panel |
 |---|---|---|---|
 | 32 | off | 3.65 s | 2.64 s |
 | 128 | 16 | 3.12 s | 2.18 s |
 
-The panel is now spread over many small parallel passes per column. Further gains need fused column
-passes and look-ahead, both still open.
+For the Pfaffian (`ib` rounded up to even):
+
+- **Panel:** after each inner block, its terms are applied to the rest of the panel (all indices below)
+  as one exact triangular product, and the lazy dots start at that inner block. Each panel entry is
+  then its block-start value minus each finished inner block's terms, one rounding per inner block.
+- **Trailing update:** unchanged; each trailing entry is its block-start value minus the whole block,
+  one rounding.
+- **Exchanges beyond the panel.** A pivot index `b` at or beyond the block end moves entries between
+  the two states. Entries entering column `k+1` are brought to the panel state from their block-start
+  values (one dot per finished inner block), and entries leaving it get their block-start values back.
+  The library keeps a block-start copy of the panel for this. GPU and host give identical bits.
+
+The recomputation costs one column of up to `block` terms per such exchange. Random matrices pivot
+beyond the panel at almost every step, so the panel work falls by about half rather than by
+`block / ib`. Smaller inner blocks are slower, because each pays its own rounding in that column. The
+gain is that much larger blocks become affordable, which cuts the GPU update severalfold.
+
+Measured (real Pfaffian, 192 bits, random entries, loaded host; ratios within a run, since absolute
+times varied twofold between runs):
+
+| n | block | inner_block | wall | panel | update | vs block 32 |
+|---|---|---|---|---|---|---|
+| 4096 | 32 | off | 5.26 s | 0.94 s | 4.29 s | 1 |
+| 4096 | 256 | 16 | 4.70 s | 3.30 s | 1.39 s | 0.89 |
+| 4096 | 256 | 32 | 3.72 s | 2.91 s | 0.81 s | 0.71 |
+| 4096 | 256 | 64 | 2.62 s | 1.96 s | 0.65 s | 0.50 |
+| 8192 | 32 | off | 32.2 s | 4.28 s | 27.7 s | 1 |
+| 8192 | 256 | 64 | 15.1 s | 10.6 s | 4.46 s | 0.47 |
+| 8192 | 512 | 64 | 17.8 s | 14.0 s | 3.75 s | 0.55 |
+| 8192 (second run) | 32 | off | 16.6 s | 2.70 s | 13.8 s | 1 |
+| 8192 (second run) | 128 | 64 | 8.41 s | 4.69 s | 3.70 s | 0.51 |
+| 8192 (second run) | 256 | 128 | 8.15 s | 5.89 s | 2.23 s | 0.49 |
+
+The values agree with block 32 to about 180 bits. The panel is now the larger part: it is many small
+parallel passes per column. Further gains need fused column passes and look-ahead, both still open.
 
 **Validation.** The replays above cover bounds (including consecutive bounds and `b = n`), `stop_at`
-at and inside a block, odd n, zero pivots inside a segment and status entries. Leading values must
-equal separate calls bit for bit, and `det(A) = det(lead) det(S)` and `Pf(A) = Pf(lead) Pf(S)` must
-hold to `2^-(bits-40)`.
+at and inside a block, odd n, zero pivots inside a segment and status entries, with and without inner
+blocks (LU: 1, 3, 4; Pfaffian: 1, 2, 4, 6, where random pivots reach beyond the block after inner
+flushes). Leading values must equal separate calls bit for bit, and `det(A) = det(lead) det(S)` and
+`Pf(A) = Pf(lead) Pf(S)` must hold to `2^-(bits-40)`, as must a two-level Pfaffian against the
+one-level value.
 
 ## Polynomial values and jets
 

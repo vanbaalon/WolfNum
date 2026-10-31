@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add two-level blocking for Pfaffians (`EliminationOptions::inner_block`, opt-in, rounded up to even;
+  previously rejected). Inner blocks are flushed into the panel as exact triangular products. An
+  exchange with an index beyond the panel recomputes the entries that cross between panel and
+  trailing matrix from block-start copies, so values depend only on `block` and `inner_block`, and GPU
+  and host agree. Measured (192 bits, random entries): block 256 with inner 64 halves the wall time
+  against block 32 at n = 4096 and 8192, and the panel is now the larger part. Validation: the MPFR
+  replay covers inner blocks 1–6 with bounds, `stop_at`, separate calls, odd n, zero pivots and
+  status entries, and a two-level Pf is checked against the one-level value.
+
 - Add Buffer forms of `factor_lu`, `factor_lu_complex` and `pfaffian` (real or complex buffers),
   bit-identical to the host-array calls (tested). Record a width table (128–256 bits) for products,
   Pfaffians and complex LU in `docs/performance.md`.
@@ -23,7 +32,7 @@
 
 - Add opt-in two-level blocking for LU (`EliminationOptions::inner_block`). Lazy panel dots span an
   inner block, and its terms are flushed as exact products; the trailing GPU update keeps the full
-  block (complex LU, 192 bits, n = 2048: 3.65 s to 3.12 s). The Pfaffian rejects it. Add the
+  block (complex LU, 192 bits, n = 2048: 3.65 s to 3.12 s). Add the
   `LIMBFORGE_ELIMINATION_API` feature macro and a double filter for the exact complex pivot
   comparison (decisions unchanged). Validation: the LU replay covers inner blocks of 1, 3 and 4
   with bounds, `stop_at` and separate-call equality.

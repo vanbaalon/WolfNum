@@ -144,11 +144,10 @@ struct LUInfo {
 // its own and its determinant / Pfaffian is reported. stop_at = k > 0 eliminates columns [0, k) only (pivots within [0, k),
 // a block ends at k; bounds must not exceed k) and keeps the Schur complement in original order: D - C A^-1 B (LU) or
 // R + Q^T P^-1 Q (skew, for A = [P Q; -Q^T R]). Without either option the factorizations are unchanged.
-// inner_block (LU only; two-level blocking, which changes the rounding sequence, so opt-in): within each block of `block`
-// columns, every inner_block columns flush their terms into the rest of the panel and, once the block's rows are final, into
-// the U rows below them, as exact products; the host's lazy dots then span at most inner_block terms while the trailing GPU
-// update keeps the full block. 0 or >= block: off. The Pfaffian rejects it (a symmetric exchange can bring an unflushed
-// column into the panel).
+// inner_block (two-level blocking, which changes the rounding sequence, so opt-in): within each block of `block` columns,
+// every inner_block columns flush their terms into the rest of the panel (LU: and, once the block's rows are final, into the U
+// rows below them) as exact products; the host's lazy dots then span at most inner_block terms while the trailing GPU update
+// keeps the full block. 0 or >= block: off. Pfaffians round it up to even.
 struct EliminationOptions : FactorOptions {
     std::vector<std::size_t> bounds;
     std::size_t stop_at=0;

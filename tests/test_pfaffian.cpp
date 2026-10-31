@@ -1,9 +1,10 @@
 // Pfaffians of real and complex skew-symmetric matrices (Linalg::pfaffian / pfaffian_complex; docs/numerics.md, "Pfaffian",
 // "Pivoting segments and partial elimination") against an independent MPFR replay of the documented blocked Parlett-Reid
 // sequence, bit for bit. The reference keeps the full skew matrix with its original entries and applies every block's terms
-// lazily when an entry is read (one dot_sub per earlier block, then the in-block dot), exchanging whole rows and columns; the
-// library applies earlier blocks eagerly on lower storage. Also: GPU and host agree; leading Pfaffians equal separate calls on
-// A[0:b, 0:b]; Pf(A) = Pf(leading) Pf(Schur); Pf(A)^2 = det(A) (factor_lu / factor_lu_complex) to working accuracy.
+// lazily when an entry is read (one dot_sub per earlier block and per finished inner block of this one, then the in-block
+// dot), exchanging whole rows and columns; the library applies earlier blocks and inner blocks eagerly on lower storage.
+// Also: GPU and host agree; leading Pfaffians equal separate calls on A[0:b, 0:b]; Pf(A) = Pf(leading) Pf(Schur);
+// Pf(A)^2 = det(A) (factor_lu / factor_lu_complex) to working accuracy.
 #include "reference.hpp"
 #include "limbforge/linalg.hpp"
 #include "element_reference.hpp"
@@ -66,8 +67,9 @@ template<int B,class R> void check(Linalg& la,const std::vector<typename R::T>& 
     for(std::size_t p=0;p<m*m;++p){require(R::equal(sg[p],ref.schur[p]),what+": Schur entry "+std::to_string(p)+" != MPFR replay");require(same(sg[p],sh[p]),what+": GPU and host Schur complements differ");}
     const std::size_t ke=stop?stop:n,blk=nb?(nb+1)/2*2:n;if(ke%2==0&&ke>blk&&ref.status_column==n&&ref.zero_pivot==n)require(gi.gpu_updates>0,what+": no GPU update");
 }
-template<int B,class R> void separate(Linalg& la,const std::vector<typename R::T>& A,std::size_t n,std::size_t nb,const std::vector<std::size_t>& bounds,const std::string& what){
-    using T=typename R::T;EliminationOptions o;o.block=nb;o.host_macs=0;o.bounds=bounds;T v;std::vector<T> lead(bounds.size());pf<B,R>(la,A,n,&v,o,lead.data());
+template<int B,class R> void separate(Linalg& la,const std::vector<typename R::T>& A,std::size_t n,std::size_t nb,const std::vector<std::size_t>& bounds,const std::string& what,
+                                      std::size_t ib=0){
+    using T=typename R::T;EliminationOptions o;o.block=nb;o.host_macs=0;o.bounds=bounds;o.inner_block=ib;T v;std::vector<T> lead(bounds.size());pf<B,R>(la,A,n,&v,o,lead.data());
     for(std::size_t k=0;k<bounds.size();++k){const std::size_t b=bounds[k];std::vector<T> sub(b*b);for(std::size_t i=0;i<b;++i)for(std::size_t j=0;j<b;++j)sub[i*b+j]=A[i*n+j];
         EliminationOptions s=o;s.bounds.assign(bounds.begin(),bounds.begin()+long(k)+1);T d;pf<B,R>(la,sub,b,&d,s);
         require(same(d,lead[k]),what+": leading Pfaffian "+std::to_string(k)+" differs from a separate call");}
@@ -79,6 +81,7 @@ template<int B,class R> void accuracy(Linalg& la,std::mt19937_64& rng,const std:
     pf<B,R>(la,A,n,&v,o);std::vector<T> full(n*n,R::zeros());for(std::size_t i=0;i<n;++i)for(std::size_t j=0;j<i;++j){full[i*n+j]=A[i*n+j];full[j*n+i]=R::neg(A[i*n+j]);}
     T det;(R::complex?la.factor_lu_complex(B,full.data(),n,o):la.factor_lu(B,full.data(),n,o)).determinant(&det);
     require(close_t<B,R>(R::product(v,v),det),what+": Pf^2 != det");
+    EliminationOptions q=o;q.block=16;q.inner_block=4;T vi;pf<B,R>(la,A,n,&vi,q);require(close_t<B,R>(vi,v),what+": two-level Pfaffian != one-level");
     EliminationOptions s=o;s.stop_at=k;std::vector<T> S((n-k)*(n-k));pf<B,R>(la,A,n,&lead,s,nullptr,S.data());pf<B,R>(la,S,n-k,&sv,o);
     require(close_t<B,R>(R::product(lead,sv),v),what+": Pf(A) != Pf(leading) Pf(Schur)");
 }
@@ -95,11 +98,17 @@ template<int B,class R> void suite(const char* label){
         for(std::size_t nb:{0,8,16}){check<B,R>(la,A,n,nb,{2,4,20,34,60},0,w+" bounds nb="+std::to_string(nb));separate<B,R>(la,A,n,nb,{2,4,20,34,60},w+" bounds");
             check<B,R>(la,A,n,nb,{6,24},24,w+" stop_at 24 nb="+std::to_string(nb));check<B,R>(la,A,n,nb,{},38,w+" stop_at 38 nb="+std::to_string(nb));}
         auto O=skew<R>(61,rng,5);check<B,R>(la,O,61,8,{10,30,60},0,w+" odd n with bounds");
-        bool threw=false;try{EliminationOptions o;o.inner_block=4;T v;pf<B,R>(la,A,n,&v,o);}catch(const std::invalid_argument&){threw=true;}require(threw,w+": inner_block accepted by a Pfaffian");}
+        // Two-level blocking: exchanges with indices beyond the panel after inner flushes (random pivots reach past the block)
+        for(std::size_t nb:{8,16,32})for(std::size_t ib:{1,2,4,6}){const std::string v=w+" nb="+std::to_string(nb)+" inner="+std::to_string(ib);
+            check<B,R>(la,A,n,nb,{},0,v,ib);check<B,R>(la,A,n,nb,{2,4,20,34,60},0,v+" bounds",ib);separate<B,R>(la,A,n,nb,{2,4,20,34,60},v+" bounds",ib);
+            check<B,R>(la,A,n,nb,{6,24},24,v+" stop_at 24",ib);check<B,R>(la,A,n,nb,{},38,v+" stop_at 38",ib);}
+        for(std::size_t m:{36,64,71}){auto M=skew<R>(m,rng,m%3?5:200);check<B,R>(la,M,m,16,{},0,w+" n="+std::to_string(m)+" nb=16 inner=4",4);}
+        check<B,R>(la,O,61,16,{10,30,60},0,w+" odd n with bounds inner=4",4);}
     {const std::size_t n=40;auto S=skew<R>(n,rng,5);[&]()->word&{if constexpr(R::complex)return S[33*n+20].re.status;else return S[33*n+20].status;}()=exponent_overflow;
         check<B,R>(la,S,n,8,{10,30},0,w+" status entry");
         auto Z=skew<R>(n,rng,5);for(std::size_t i=0;i<n;++i)for(std::size_t j=0;j<i;++j)if(i==12||j==12)Z[i*n+j]=R::zeros();check<B,R>(la,Z,n,8,{},0,w+" zero row and column");
         check<B,R>(la,Z,n,8,{6,12,14,20,40},0,w+" zero pivot in a segment");
+        check<B,R>(la,S,n,16,{10,30},0,w+" status entry inner=4",4);check<B,R>(la,Z,n,16,{6,12,14,20,40},0,w+" zero pivot inner=4",4);
         T v;auto info=pf<B,R>(la,Z,n,&v,EliminationOptions{});require(R::is_zero(v)&&!R::status(v)&&info.zero_pivot<n,w+": zero column: Pf != 0 or no zero pivot");}
     accuracy<B,R>(la,rng,w);buffers<B,R>(rng,w);
     std::cout<<w<<": Pfaffians, leading Pfaffians and Schur complements match the MPFR replay; GPU and host agree; Pf^2 = det\n";

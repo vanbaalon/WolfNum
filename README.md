@@ -91,7 +91,7 @@ measurements.
 - **Unreleased:** Pfaffians of real skew-symmetric matrices (`Linalg::pfaffian`, blocked Parlett–Reid with GPU skew
   updates); see [Pfaffian](docs/numerics.md#pfaffian).
 - **Unreleased:** complex LU and Pfaffians (`factor_lu_complex`, `pfaffian_complex`), leading determinants/Pfaffians
-  at caller bounds and Schur complements from one factorization; see
+  at caller bounds, Schur complements from one factorization and opt-in two-level blocking (`inner_block`); see
   [complex LU and Pfaffians](docs/numerics.md#complex-lu-and-pfaffians) and
   [pivoting segments](docs/numerics.md#pivoting-segments-and-partial-elimination).
 - Real and complex Householder QR, optional column pivoting, reusable least-squares factors,

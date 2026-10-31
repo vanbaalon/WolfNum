@@ -804,6 +804,12 @@ template<class Fd> Timing Linalg::Impl::lu_solve_any(const detail::LUData& f,con
 // step. Later columns of a block take its pending terms lazily (one rounding per component); at the end of the block the
 // trailing lower triangle takes them as one exact triangular product (GPU) or exact dots (host), identical bits. Pivots are
 // chosen before the step's segment end. Pf = det(P) * prod_k a_k.
+// Two-level blocking (inner_block = ib): after every ib columns, their terms are applied to the rest of the panel (all rows
+// below) as one exact product, and the lazy dots start at that inner block. Every panel entry is thus its block-start value
+// minus each finished inner block's terms (one rounding each), and every trailing entry its block-start value minus the whole
+// block (one rounding). An exchange with an index b beyond the panel moves entries between the two: entries entering column
+// k+1 are brought to the panel state from their block-start values, and entries leaving it get their block-start values back
+// (O keeps the block-start panel entries, exchanged with W).
 template<class Fd> PfaffianInfo Linalg::Impl::pfaffian_any(const typename Fd::T* A,std::size_t n,const EliminationOptions& o,typename Fd::T& out,
                                                            typename Fd::T* leading,typename Fd::T* schur){@autoreleasepool{
     using T=typename Fd::T;constexpr int N=Fd::N,w=Fd::width;auto start=Clock::now();PfaffianInfo info;info.zero_pivot=info.status_column=n;pool_workers();
@@ -820,26 +826,49 @@ template<class Fd> PfaffianInfo Linalg::Impl::pfaffian_any(const typename Fd::T*
     id<MTLBuffer> pb=buffer("pfaffian_p",std::max<std::size_t>(1,n*nb)*sizeof(T)),qb=buffer("pfaffian_q",std::max<std::size_t>(1,w*n*L)*sizeof(Number<N>));
     T* P=static_cast<T*>(pb.contents);Number<N>* Q=static_cast<Number<N>*>(qb.contents);
     if(gpu){id<MTLBuffer> b=wrap(W,n*n*sizeof(T));if(!b)throw std::runtime_error("Metal buffer wrap failed (pfaffian)");resident.push_back(b);resident.push_back(pb);resident.push_back(qb);}
-    auto D=[&](const T& c,std::size_t i,std::size_t j,std::size_t off,std::size_t K){return Fd::dot(c,P+i*nb,Q,L,j,off,K);};
-    // Symmetric exchange of indices a < b among the active indices >= k (column k is the only finished column still read).
-    auto exchange=[&](std::size_t k,std::size_t a,std::size_t b){
+    auto D=[&](const T& c,std::size_t i,std::size_t j,std::size_t off,std::size_t K){return Fd::dot(c,P+i*nb+off,Q,L,j,off,K);};
+    const std::size_t ib=o.inner_block?std::min(nb,std::max<std::size_t>(2,(o.inner_block+1)/2*2)):nb;
+    detail::PageBlock saved(ib<nb?n*nb*sizeof(T):0);T* O=static_cast<T*>(saved.p);   // O[i*nb + c - k0]: block-start panel entry (i, c), i > c
+    // v minus each finished inner block's terms [0, terms) (one rounding each): the panel state of an entry (i, c).
+    auto history=[&](T v,std::size_t i,std::size_t c,std::size_t terms){for(std::size_t off=0;off<terms;off+=ib)v=D(v,i,c,off,ib);return v;};
+    // Symmetric exchange of indices a < b among the active indices >= k (column k is the only finished column still read). In a
+    // two-level block [k0, k1) with `terms` flushed terms, also O, and the entries crossing between panel and trailing matrix.
+    auto exchange=[&](std::size_t k,std::size_t a,std::size_t b,bool two,std::size_t k0,std::size_t k1,std::size_t terms){
         for(std::size_t j=k;j<a;++j)std::swap(W[a*n+j],W[b*n+j]);
         for(std::size_t i=a+1;i<b;++i){T t=W[i*n+a];W[i*n+a]=Fd::neg(W[b*n+i]);W[b*n+i]=Fd::neg(t);}
         W[b*n+a]=Fd::neg(W[b*n+a]);
         for(std::size_t i=b+1;i<n;++i)std::swap(W[i*n+a],W[i*n+b]);
-        std::swap_ranges(P+a*nb,P+a*nb+nb,P+b*nb);std::swap_ranges(Q+w*a*L,Q+w*a*L+w*L,Q+w*b*L);};
+        std::swap_ranges(P+a*nb,P+a*nb+nb,P+b*nb);std::swap_ranges(Q+w*a*L,Q+w*a*L+w*L,Q+w*b*L);
+        if(!two)return;
+        auto s=[&](std::size_t i,std::size_t c)->T&{return O[i*nb+c-k0];};
+        for(std::size_t j=k;j<a;++j)std::swap(s(a,j),s(b,j));
+        for(std::size_t i=a+1;i<std::min(b,k1);++i){T t=s(i,a);s(i,a)=Fd::neg(s(b,i));s(b,i)=Fd::neg(t);}
+        s(b,a)=Fd::neg(s(b,a));
+        if(b<k1){for(std::size_t i=b+1;i<n;++i)std::swap(s(i,a),s(i,b));return;}
+        // Trailing indices i: W (i, a) now holds a block-start value (v), and (i, b) or (b, i) the panel state of O's (i, a) (u).
+        each(n-k1,[&](std::size_t r){const std::size_t i=k1+r;if(i==b)return;const T u=s(i,a),v=W[i*n+a];s(i,a)=v;
+            if(i>b)W[i*n+b]=u;else W[b*n+i]=Fd::neg(u);W[i*n+a]=history(v,i,a,terms);});};
+    // Panel columns [i1, k1), all rows below, take terms [off, off+K): one exact triangular product (GPU) or exact dots (host).
+    auto flush=[&](std::size_t i1,std::size_t k1,std::size_t off,std::size_t K){if(i1>=k1||!K)return;auto t=Clock::now();const std::size_t M=n-i1,C=k1-i1;
+        if(gpu&&double(M)*double(C)*double(K)*w*w>=o.host_macs){auto* pp=reinterpret_cast<const unsigned char*>(P+i1*nb+off);auto* qq=reinterpret_cast<const unsigned char*>(Q+w*i1*L+w*off);
+            Timing tm=run(32*N,View{pp,sizeof(Number<N>),w*nb,1,N},View{qq,sizeof(Number<N>),L,1,N},M,w*C,w*K,W+i1*n+i1,false,false,true,w*n,false,false,1,w-1);
+            info.timing.gpu_seconds+=tm.gpu_seconds;++info.gpu_updates;}
+        else{each(M,[&](std::size_t r){const std::size_t i=i1+r;for(std::size_t c=i1;c<std::min(k1,i);++c)W[i*n+c]=D(W[i*n+c],i,c,off,K);});++info.host_updates;}
+        info.update_seconds+=since(t);};
     bool first=true;std::size_t bi=0;
     auto leads=[&](std::size_t upto,const T& v){ // bounds <= upto get v; after a zero pivot, later ones stay invalid
         for(;bi<o.bounds.size()&&o.bounds[bi]<=upto;++bi)if(leading)leading[bi]=v;};
     std::size_t k=0;
-    for(std::size_t k0=0;k0<ke;k0=k){auto t=Clock::now();++info.blocks;std::size_t s=0,s0=0;const std::size_t k1=std::min({n,k0+nb,ke});
+    for(std::size_t k0=0;k0<ke;k0=k){auto t=Clock::now();++info.blocks;std::size_t s=0,s0=0;const std::size_t k1=std::min({n,k0+nb,ke});const bool two=k1-k0>ib;
+        if(two)each(n-k0-1,[&](std::size_t r){const std::size_t i=k0+1+r;for(std::size_t c=k0;c<std::min(i,k1);++c)O[i*nb+c-k0]=W[i*n+c];});
         for(k=k0;k<k1;k+=2,++s){
+            if(k>k0&&(k-k0)%ib==0){info.panel_seconds+=since(t);flush(k,k1,2*s0,2*(s-s0));s0=s;t=Clock::now();}
             each(n-k-1,[&](std::size_t r){const std::size_t i=k+1+r;W[i*n+k]=D(W[i*n+k],i,k,2*s0,2*(s-s0));});
             const std::size_t e=segment_end(limits,k,n);word st=0;std::size_t p=k+1;
             for(std::size_t i=k+1;i<e;++i){st|=Fd::status(W[i*n+k]);if(Fd::compare(W[i*n+k],W[p*n+k])>0)p=i;}
             if(st){info.status_column=k;info.status=st;out=Fd::zeros(st);info.panel_seconds+=since(t);return finish();}
             if(Fd::is_zero(W[p*n+k])){info.zero_pivot=k;leads(e,Fd::zeros());out=e>=ke?Fd::zeros():Fd::zeros(invalid);info.panel_seconds+=since(t);return finish();}
-            if(p!=k+1){exchange(k,k+1,p);info.sign=-info.sign;}
+            if(p!=k+1){exchange(k,k+1,p,two,k0,k1,2*s0);info.sign=-info.sign;}
             const T a=Fd::neg(W[(k+1)*n+k]);out=first?a:Fd::product(out,a);first=false;
             leads(k+2,info.sign<0?Fd::neg(out):out);
             each(n-k-2,[&](std::size_t r){const std::size_t i=k+2+r;T& y=W[i*n+k+1];y=D(y,i,k+1,2*s0,2*(s-s0));const T tau=Fd::quotient(W[i*n+k],a);
@@ -1179,14 +1208,12 @@ std::vector<std::size_t> segment_limits(const EliminationOptions& o,std::size_t 
 }
 PfaffianInfo Linalg::pfaffian(int bits,const void* A,std::size_t n,void* out,const EliminationOptions& o,void* leading,void* schur){
     check_bits(bits);check_size(n,1);if(n&&!A)throw std::invalid_argument("null matrix");if(!out)throw std::invalid_argument("null output");segment_limits(o,n,true,"pfaffian");
-    if(o.inner_block)throw std::invalid_argument("pfaffian: inner_block applies to LU only");
     return by_words(bits/32,[&](auto w){constexpr int N=decltype(w)::value;using Fd=RealField<N>;typename Fd::T r;
         PfaffianInfo info=impl->pfaffian_any<Fd>(static_cast<const Number<N>*>(A),n,o,r,static_cast<Number<N>*>(leading),static_cast<Number<N>*>(schur));
         std::memcpy(out,&r,sizeof r);return info;});
 }
 PfaffianInfo Linalg::pfaffian_complex(int bits,const void* A,std::size_t n,void* out,const EliminationOptions& o,void* leading,void* schur){
     check_bits(bits);check_size(n,1);if(n&&!A)throw std::invalid_argument("null matrix");if(!out)throw std::invalid_argument("null output");segment_limits(o,n,true,"pfaffian_complex");
-    if(o.inner_block)throw std::invalid_argument("pfaffian_complex: inner_block applies to LU only");
     return by_words(bits/32,[&](auto w){constexpr int N=decltype(w)::value;using Fd=ComplexField<N>;typename Fd::T r;
         PfaffianInfo info=impl->pfaffian_any<Fd>(static_cast<const Complex<N>*>(A),n,o,r,static_cast<Complex<N>*>(leading),static_cast<Complex<N>*>(schur));
         std::memcpy(out,&r,sizeof r);return info;});
