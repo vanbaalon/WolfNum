@@ -13,7 +13,7 @@
 using namespace limbforge;
 void require(bool condition,const std::string& message){if(!condition)throw std::runtime_error(message);}
 template<class R> struct RefLU {std::vector<typename R::T> W,lead;typename R::T det;std::vector<std::size_t> perm;int sign=1;std::size_t zero_pivot,status_column;};
-template<class R> RefLU<R> reference_lu(std::vector<typename R::T> W,std::size_t n,std::size_t nb,const std::vector<std::size_t>& bounds,std::size_t ke){
+template<class R> RefLU<R> reference_lu(std::vector<typename R::T> W,std::size_t n,std::size_t nb,const std::vector<std::size_t>& bounds,std::size_t ke,std::size_t ib=0){
     using T=typename R::T;RefLU<R> r;r.perm.resize(n);std::iota(r.perm.begin(),r.perm.end(),0);r.zero_pivot=r.status_column=n;
     std::vector<std::size_t> limits=bounds;if(ke<n)limits.push_back(ke);
     auto seg=[&](std::size_t j){for(auto b:limits)if(b>j)return b;return n;};
@@ -23,11 +23,16 @@ template<class R> RefLU<R> reference_lu(std::vector<typename R::T> W,std::size_t
     auto D=[&](std::size_t i,std::size_t j,std::size_t q0,std::size_t q1){std::vector<T> x,y;for(std::size_t q=q0;q<q1;++q){x.push_back(at(i,q));y.push_back(at(q,j));}return R::D(at(i,j),x,y);};
     // Column j (j < ke) or a trailing column (j >= ke): the U rows and trailing updates of the blocks before min(j, ke)'s block.
     auto block_start=[&](std::size_t j){std::size_t k0=0;for(auto s:starts)if(s<=j)k0=s;return k0;};
+    if(!ib||ib>nb)ib=nb;auto inner_start=[&](std::size_t j){const std::size_t k0=block_start(j);return k0+(j-k0)/ib*ib;};
+    // Inner block [a0, a1) of outer block [b0, b1): its U rows (D over [a0, r)), then its terms for the rows from a1 to `to`.
+    auto inner=[&](std::size_t j,std::size_t a0,std::size_t a1,std::size_t to){for(std::size_t i=a0;i<a1;++i)at(i,j)=D(i,j,a0,i);for(std::size_t i=a1;i<to;++i)at(i,j)=D(i,j,a0,a1);};
     auto earlier=[&](std::size_t j){const std::size_t limit=j<ke?block_start(j):ke;
         for(std::size_t b=0;b+1<starts.size()&&starts[b+1]<=limit;++b){const std::size_t b0=starts[b],b1=starts[b+1];
-            for(std::size_t i=b0;i<b1;++i)at(i,j)=D(i,j,b0,i);for(std::size_t i=b1;i<n;++i)at(i,j)=D(i,j,b0,b1);}};
+            for(std::size_t a0=b0;a0<b1;a0+=ib)inner(j,a0,std::min(b1,a0+ib),b1);   // U rows: one rounding per inner block
+            for(std::size_t i=b1;i<n;++i)at(i,j)=D(i,j,b0,b1);}                   // trailing: one rounding per outer block
+        if(j<ke)for(std::size_t a0=block_start(j);a0<inner_start(j);a0+=ib)inner(j,a0,a0+ib,n);};   // panel: flushed inner blocks
     T prod=R::one();bool first=true;std::size_t poison=n,bi=0;r.lead.assign(bounds.size(),R::zeros(invalid));std::size_t stop=n;
-    for(std::size_t j=0;j<ke;++j){const std::size_t k0=block_start(j);
+    for(std::size_t j=0;j<ke;++j){const std::size_t k0=inner_start(j);
         earlier(j);for(std::size_t i=k0;i<j;++i)at(i,j)=D(i,j,k0,i);for(std::size_t i=j;i<n;++i)at(i,j)=D(i,j,k0,j);
         const std::size_t e=seg(j);word st=0;std::size_t p=j;for(std::size_t i=j;i<e;++i){st|=R::status(at(i,j));if(R::compare(at(i,j),at(p,j))>0)p=i;}
         if(st){stop=r.status_column=j;break;}
@@ -57,10 +62,10 @@ template<class R> std::vector<typename R::T> random_matrix(std::size_t rows,std:
 template<int B,class R> LUFactor factor(Linalg& la,const std::vector<typename R::T>& A,std::size_t n,const EliminationOptions& o){
     return R::complex?la.factor_lu_complex(B,A.data(),n,o):la.factor_lu(B,A.data(),n,o);}
 template<int B,class R> void check(Linalg& la,const std::vector<typename R::T>& A,std::size_t n,std::size_t nb,const std::vector<std::size_t>& bounds,std::size_t stop,
-                                   const std::string& what,std::mt19937_64& rng){
-    using T=typename R::T;EliminationOptions o;o.block=nb;o.host_macs=0;o.solve_host_macs=0;o.bounds=bounds;o.stop_at=stop;EliminationOptions h=o;h.gpu=false;
+                                   const std::string& what,std::mt19937_64& rng,std::size_t ib=0){
+    using T=typename R::T;EliminationOptions o;o.block=nb;o.host_macs=0;o.solve_host_macs=0;o.bounds=bounds;o.stop_at=stop;o.inner_block=ib;EliminationOptions h=o;h.gpu=false;
     const std::size_t blk=nb?std::min(nb,std::max<std::size_t>(n,1)):std::max<std::size_t>(n,1),ke=stop?stop:n;
-    auto ref=reference_lu<R>(A,n,blk,bounds,ke);auto f=factor<B,R>(la,A,n,o),g=factor<B,R>(la,A,n,h);
+    auto ref=reference_lu<R>(A,n,blk,bounds,ke,ib);auto f=factor<B,R>(la,A,n,o),g=factor<B,R>(la,A,n,h);
     const T* W=static_cast<const T*>(f.lu());const T* V=static_cast<const T*>(g.lu());
     for(std::size_t p=0;p<n*n;++p){require(R::equal(W[p],ref.W[p]),what+": factor entry "+std::to_string(p)+" != MPFR replay");require(same(W[p],V[p]),what+": GPU and host factors differ");}
     for(std::size_t i=0;i<n;++i)require(f.permutation()[i]==ref.perm[i],what+": permutation");
@@ -75,8 +80,8 @@ template<int B,class R> void check(Linalg& la,const std::vector<typename R::T>& 
         else for(auto& x:X)require(R::status(x)==invalid&&R::is_zero(x),what+": solve of a status factor");}
 }
 // Leading determinants equal separate calls on A[0:b, 0:b] (bounds truncated to b), bit for bit.
-template<int B,class R> void separate(Linalg& la,const std::vector<typename R::T>& A,std::size_t n,std::size_t nb,const std::vector<std::size_t>& bounds,const std::string& what){
-    using T=typename R::T;EliminationOptions o;o.block=nb;o.host_macs=0;o.bounds=bounds;auto f=factor<B,R>(la,A,n,o);std::vector<T> lead(bounds.size());f.leading_determinants(lead.data());
+template<int B,class R> void separate(Linalg& la,const std::vector<typename R::T>& A,std::size_t n,std::size_t nb,const std::vector<std::size_t>& bounds,const std::string& what,std::size_t ib=0){
+    using T=typename R::T;EliminationOptions o;o.block=nb;o.host_macs=0;o.bounds=bounds;o.inner_block=ib;auto f=factor<B,R>(la,A,n,o);std::vector<T> lead(bounds.size());f.leading_determinants(lead.data());
     for(std::size_t k=0;k<bounds.size();++k){const std::size_t b=bounds[k];std::vector<T> sub(b*b);for(std::size_t i=0;i<b;++i)for(std::size_t j=0;j<b;++j)sub[i*b+j]=A[i*n+j];
         EliminationOptions s=o;s.bounds.assign(bounds.begin(),bounds.begin()+long(k)+1);T d;factor<B,R>(la,sub,b,s).determinant(&d);
         require(same(d,lead[k]),what+": leading determinant "+std::to_string(k)+" differs from a separate call");}
@@ -108,7 +113,10 @@ template<int B,class R> void suite(const char* label){
     // Segments: leading determinants, bounds 1 apart, b = n; partial elimination at a block end and inside a block.
     {const std::size_t n=60;auto A=random_matrix<R>(n,n,rng,6);
         for(std::size_t nb:{0,8,16}){check<B,R>(la,A,n,nb,{5,6,20,33,60},0,w+" bounds nb="+std::to_string(nb),rng);separate<B,R>(la,A,n,nb,{5,6,20,33,60},w+" bounds");
-            check<B,R>(la,A,n,nb,{7,24},24,w+" stop_at 24 nb="+std::to_string(nb),rng);check<B,R>(la,A,n,nb,{},37,w+" stop_at 37 nb="+std::to_string(nb),rng);}}
+            check<B,R>(la,A,n,nb,{7,24},24,w+" stop_at 24 nb="+std::to_string(nb),rng);check<B,R>(la,A,n,nb,{},37,w+" stop_at 37 nb="+std::to_string(nb),rng);}
+        // Two-level blocking: inner blocks of 1, 3 and 4 columns within blocks of 16 (and a ragged last block).
+        for(std::size_t ib:{1,3,4}){check<B,R>(la,A,n,16,{},0,w+" inner="+std::to_string(ib),rng,ib);check<B,R>(la,A,n,16,{7,33,60},0,w+" inner bounds="+std::to_string(ib),rng,ib);
+            check<B,R>(la,A,n,16,{},37,w+" inner stop_at 37 ib="+std::to_string(ib),rng,ib);separate<B,R>(la,A,n,16,{7,33,60},w+" inner bounds",ib);}}
     {const std::size_t n=40;auto S=random_matrix<R>(n,n,rng,6);[&]()->word&{if constexpr(R::complex)return S[25*n+30].im.status;else return S[25*n+30].status;}()=exponent_overflow;check<B,R>(la,S,n,16,{10,30},0,w+" status entry",rng);
         auto Z=random_matrix<R>(n,n,rng,6);for(std::size_t r=0;r<n;++r)Z[r*n+9]=R::zeros();check<B,R>(la,Z,n,8,{},0,w+" zero column",rng);
         auto Y=random_matrix<R>(n,n,rng,6);for(std::size_t r=0;r<12;++r)Y[r*n+9]=R::zeros();check<B,R>(la,Y,n,8,{12,20,40},0,w+" zero pivot in a segment",rng);

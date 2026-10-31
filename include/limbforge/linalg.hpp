@@ -3,6 +3,7 @@
 #define LIMBFORGE_GEMM_SPEC_API 1
 #define LIMBFORGE_LU_API 1
 #define LIMBFORGE_PFAFFIAN_API 1
+#define LIMBFORGE_ELIMINATION_API 1  // EliminationOptions (bounds, stop_at, inner_block), complex LU and Pfaffians
 // Dense real products with one rounding per output (plan D6 via L1c): C[i][j] = RN(sum_k L[i][k]*R[k][j]),
 // or RN(C[i][j] - sum_k ...) as an update, computed exactly by an integer GEMM over residues (Metal TensorOps
 // int8) and rounded once, ties to even. Contract and algorithm: docs/numerics.md, "Dense products". Host arrays, and
@@ -141,9 +142,15 @@ struct LUInfo {
 // its own and its determinant / Pfaffian is reported. stop_at = k > 0 eliminates columns [0, k) only (pivots within [0, k),
 // a block ends at k; bounds must not exceed k) and keeps the Schur complement in original order: D - C A^-1 B (LU) or
 // R + Q^T P^-1 Q (skew, for A = [P Q; -Q^T R]). Without either option the factorizations are unchanged.
+// inner_block (LU only; two-level blocking, which changes the rounding sequence, so opt-in): within each block of `block`
+// columns, every inner_block columns flush their terms into the rest of the panel and, once the block's rows are final, into
+// the U rows below them, as exact products; the host's lazy dots then span at most inner_block terms while the trailing GPU
+// update keeps the full block. 0 or >= block: off. The Pfaffian rejects it (a symmetric exchange can bring an unflushed
+// column into the panel).
 struct EliminationOptions : FactorOptions {
     std::vector<std::size_t> bounds;
     std::size_t stop_at=0;
+    std::size_t inner_block=0;
 };
 // Pfaffian of a real skew-symmetric matrix by blocked Parlett-Reid elimination with pivoting (docs/numerics.md, "Pfaffian").
 // FactorOptions: block = columns per block (rounded up to even; 0 = one block), host_macs and gpu as Cholesky; the value depends

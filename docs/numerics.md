@@ -961,8 +961,10 @@ run the real sequences step for step. Only the elementary operations change:
   forms each part as an exact real dot of `2|S|` interleaved terms; the GPU trailing updates are the
   same exact products, with real columns `2j` and `2j + 1` of complex column `j`.
 - **Pivots.** Pivots compare `|z|^2 = re^2 + im^2` exactly. Leading exponents that differ by two or
-  more decide directly; otherwise both values are scaled by the same power of two and the sign of
-  the exact four-term difference decides. Ties go to the lowest row or index.
+  more decide directly. Otherwise a double estimate from the top 64 mantissa bits of each part
+  (error below `2^-49` relative) decides when the two estimates differ by more than `10^-12`. Closer
+  values are scaled by a common power of two, and the sign of the exact four-term difference
+  decides. Ties go to the lowest row or index.
 - **Division.** `s / u` takes `u' = u 2^-e`, with `e` the leading exponent of `u`, and
   `d = RN(|u'|^2)`. Then `re = RN(RN(s.re u'.re + s.im u'.im) / d) 2^-e` and
   `im = RN(RN(s.im u'.re - s.re u'.im) / d) 2^-e`: each numerator and `d` are one rounding of
@@ -990,8 +992,9 @@ against `factor_qr_complex`, to `2^-(bits-40)`.
 
 ## Pivoting segments and partial elimination
 
-`EliminationOptions` (derived from `FactorOptions`) adds two options to `factor_lu`,
-`factor_lu_complex`, `pfaffian` and `pfaffian_complex`. Without them the factorizations are unchanged.
+`EliminationOptions` (derived from `FactorOptions`; feature macro `LIMBFORGE_ELIMINATION_API`) adds
+options to `factor_lu`, `factor_lu_complex`, `pfaffian` and `pfaffian_complex`. Without them the
+factorizations are unchanged.
 
 ```cpp
 EliminationOptions o;
@@ -1025,6 +1028,32 @@ la.pfaffian(bits, A, n, &pf_lead, o, nullptr, S); // S = R + Q^T P^-1 Q (full sk
     throws `logic_error`.
   - For the Pfaffian of `[P Q; -Q^T R]` it is `R + Q^T P^-1 Q`, written with both triangles, and
     `out` is `Pf(P)`. `k` must be even.
+
+**Two-level blocking (LU only, opt-in).** `EliminationOptions::inner_block = ib` changes the LU sequence
+inside each block of `block` columns, so it is opt-in:
+
+- **Panel:** columns are processed in inner blocks of `ib`. The lazy panel dots span the current inner
+  block only. After each inner block, its U entries of the later panel columns are formed, and its
+  terms are applied to the rest of the panel (all rows below) as one exact product.
+- **U rows:** once the block's rows are final, the U rows to its right are formed per inner block in
+  the same way.
+- **Trailing update:** unchanged, one rounding per block of `block` columns.
+
+Panel and U-row entries thus carry one rounding per inner block. The host's lazy dots shrink from up
+to `block` terms to at most `ib`, while the GPU trailing update keeps the large block. Bounds,
+`stop_at` and leading values work as before, and leading values still equal separate calls with the
+same options.
+
+The Pfaffian rejects `inner_block`: a symmetric exchange with an index outside the block would bring
+an unflushed column into the panel. Measured (complex LU, 192 bits, n = 2048, loaded host):
+
+| block | inner_block | wall | panel |
+|---|---|---|---|
+| 32 | off | 3.65 s | 2.64 s |
+| 128 | 16 | 3.12 s | 2.18 s |
+
+The panel is now spread over many small parallel passes per column. Further gains need fused column
+passes and look-ahead, both still open.
 
 **Validation.** The replays above cover bounds (including consecutive bounds and `b = n`), `stop_at`
 at and inside a block, odd n, zero pivots inside a segment and status entries. Leading values must

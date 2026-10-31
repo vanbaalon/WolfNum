@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add opt-in two-level blocking for LU (`EliminationOptions::inner_block`). Lazy panel dots span an
+  inner block, and its terms are flushed as exact products; the trailing GPU update keeps the full
+  block (complex LU, 192 bits, n = 2048: 3.65 s to 3.12 s). The Pfaffian rejects it. Add the
+  `LIMBFORGE_ELIMINATION_API` feature macro and a double filter for the exact complex pivot
+  comparison (decisions unchanged). Validation: the LU replay covers inner blocks of 1, 3 and 4
+  with bounds, `stop_at` and separate-call equality.
+
 - Add complex LU and complex Pfaffians (`factor_lu_complex`, `pfaffian_complex`). Complex dots round each
   component once, pivots compare |z|^2 exactly, and the scaled complex division is documented. The
   complex solve uses GPU block updates for many right-hand sides, and the determinant keeps its phase.
