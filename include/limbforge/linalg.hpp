@@ -59,6 +59,7 @@ struct LinalgWorkspaces {
 namespace detail {
 struct LinalgPass;
 template<class T> constexpr int real_bits(){static_assert(Format<T>::bits&&!Format<T>::complex,"dense linear algebra uses real Float<bits> buffers");return Format<T>::bits;}
+template<class T> constexpr int complex_bits(){static_assert(Format<T>::bits&&Format<T>::complex,"complex dense linear algebra uses Complex<bits/32> buffers");return Format<T>::bits;}
 }
 // Handle of a resident product (Linalg::syrk / gemm on a CommandBatch). C is final only after Submission::wait(), which also
 // computes the outputs of host-fallback lines (docs/numerics.md, "Resident products"). Copies share state.
@@ -349,6 +350,14 @@ public:
         return solve_buffers(detail::real_bits<T>(),3,detail::Access::operand(L),n,detail::Access::operand(B),nrhs,detail::Access::operand(X),options);}
     template<class T> QRFactor factor_qr(const Buffer<T>& A,std::size_t m,std::size_t n,const QROptions& options={}){
         return factor_qr_buffer(detail::real_bits<T>(),detail::Access::operand(A),m,n,options);}
+    // LU and Pfaffians of a Buffer (e.g. a matrix assembled on the GPU), the same rules; out, leading and schur stay host pointers.
+    template<class T> LUFactor factor_lu(const Buffer<T>& A,std::size_t n,const EliminationOptions& options={}){
+        return factor_lu_buffer(detail::real_bits<T>(),false,detail::Access::operand(A),n,options);}
+    template<class T> LUFactor factor_lu_complex(const Buffer<T>& A,std::size_t n,const EliminationOptions& options={}){
+        return factor_lu_buffer(detail::complex_bits<T>(),true,detail::Access::operand(A),n,options);}
+    template<class T> PfaffianInfo pfaffian(const Buffer<T>& A,std::size_t n,void* out,const EliminationOptions& options={},void* leading=nullptr,void* schur=nullptr){
+        static_assert(detail::Format<T>::bits,"pfaffian: Float or Complex buffer");
+        return pfaffian_buffer(detail::Format<T>::bits,detail::Format<T>::complex,detail::Access::operand(A),n,out,options,leading,schur);}
     // Explicit contract names. Existing entry points keep identical defaults and behavior.
     Timing gemm_exact(int bits,bool transpose_a,const void* A,const void* B,std::size_t m,std::size_t n,std::size_t k,void* C,bool subtract=false){return gemm(bits,transpose_a,A,B,m,n,k,C,subtract);}
     Timing syrk_exact(int bits,const void* A,std::size_t rows,std::size_t cols,void* C,bool lower_only=true,bool subtract=false){return syrk(bits,A,rows,cols,C,lower_only,subtract);}
@@ -364,6 +373,8 @@ private:
     CholeskyInfo cholesky_buffers(int bits,const detail::Operand& A,std::size_t n,const detail::Operand& L,const FactorOptions&);
     Timing solve_buffers(int bits,int passes,const detail::Operand& L,std::size_t n,const detail::Operand& B,std::size_t nrhs,const detail::Operand& X,const FactorOptions&);
     QRFactor factor_qr_buffer(int bits,const detail::Operand& A,std::size_t m,std::size_t n,const QROptions&);
+    LUFactor factor_lu_buffer(int bits,bool complex,const detail::Operand& A,std::size_t n,const EliminationOptions&);
+    PfaffianInfo pfaffian_buffer(int bits,bool complex,const detail::Operand& A,std::size_t n,void* out,const EliminationOptions&,void* leading,void* schur);
     friend class QRFactor; friend class LUFactor; friend struct detail::LinalgHooks; struct Impl; std::unique_ptr<Impl> impl;
 };
 // ---- Exact dot product on the CPU: RN(sum_k a[k*sa]*b[k*sb]) with one rounding (the GPU fallback) ----

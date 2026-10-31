@@ -123,6 +123,12 @@ template<int B,int Lo,class R,class RL> void refinement(Linalg& la,std::mt19937_
     for(std::size_t p=0;p<X.size();++p){if constexpr(R::complex)require(close<B>(X[p].re,Y[p].re)&&close<B>(X[p].im,Y[p].im),what+": refined solution");else require(close<B>(X[p],Y[p]),what+": refined solution");}
     bool threw=false;try{full.solve_refined(Lo,Al.data(),Al.data(),nrhs,X.data(),1);}catch(const std::invalid_argument&){threw=true;}require(threw,what+": bits_full below the factor width accepted");
 }
+// Buffer forms equal the host-array calls bit for bit.
+template<int B,class R> void buffers(std::mt19937_64& rng,const std::string& what){
+    using T=typename R::T;Engine e;Linalg la(e);const std::size_t n=50;auto A=random_matrix<R>(n,n,rng,6);EliminationOptions o;o.block=8;o.host_macs=0;o.bounds={20,50};
+    auto buf=e.make_buffer<T>(n*n);buf.upload(A.data(),n*n);auto f=[&]{if constexpr(R::complex)return la.factor_lu_complex(buf,n,o);else return la.factor_lu(buf,n,o);}();auto g=factor<B,R>(la,A,n,o);
+    require(!std::memcmp(f.lu(),g.lu(),n*n*sizeof(T)),what+": buffer factor differs");T d1,d2;f.determinant(&d1);g.determinant(&d2);require(same(d1,d2),what+": buffer determinant differs");
+}
 template<int B,class R> void suite(const char* label){
     std::mt19937_64 rng(11+B+R::complex);Linalg la;const std::string w=std::string(label)+" bits="+std::to_string(B);
     for(std::size_t n:{0,1,2,5,37,70})for(std::size_t nb:{0,1,8,16,32}){
@@ -138,7 +144,7 @@ template<int B,class R> void suite(const char* label){
         auto Z=random_matrix<R>(n,n,rng,6);for(std::size_t r=0;r<n;++r)Z[r*n+9]=R::zeros();check<B,R>(la,Z,n,8,{},0,w+" zero column",rng);
         auto Y=random_matrix<R>(n,n,rng,6);for(std::size_t r=0;r<12;++r)Y[r*n+9]=R::zeros();check<B,R>(la,Y,n,8,{12,20,40},0,w+" zero pivot in a segment",rng);
         auto f=factor<B,R>(la,Z,n,EliminationOptions{});require(!f.nonsingular()&&f.info().zero_pivot==9,w+": zero column not reported as zero pivot 9");}
-    accuracy<B,R>(la,rng,w);
+    accuracy<B,R>(la,rng,w);buffers<B,R>(rng,w);
     if constexpr(B==256){if constexpr(R::complex)refinement<B,128,R,RC<128>>(la,rng,w);else refinement<B,128,R,RR<128>>(la,rng,w);}
     else{if constexpr(R::complex)refinement<B,256,R,RC<256>>(la,rng,w);else refinement<B,256,R,RR<256>>(la,rng,w);}
     std::cout<<w<<": LU factors, permutations, solves, determinants, leading determinants and Schur complements match the MPFR replay\n";

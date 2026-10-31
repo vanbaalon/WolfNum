@@ -1513,6 +1513,14 @@ CholeskyInfo Linalg::cholesky_buffers(int bits,const detail::Operand& A,std::siz
     check_bits(bits);check_size(n,1);Claim<Impl> claim(*impl);
     void* a=claim.add(A,n*n,"cholesky A");void* l=claim.add(L,n*n,"cholesky L");return cholesky(bits,a,n,l,o);
 }
+LUFactor Linalg::factor_lu_buffer(int bits,bool complex,const detail::Operand& A,std::size_t n,const EliminationOptions& o){
+    check_bits(bits);check_size(n,1);Claim<Impl> claim(*impl);void* a=claim.add(A,n*n,complex?"factor_lu_complex A":"factor_lu A");
+    return complex?factor_lu_complex(bits,a,n,o):factor_lu(bits,a,n,o);
+}
+PfaffianInfo Linalg::pfaffian_buffer(int bits,bool complex,const detail::Operand& A,std::size_t n,void* out,const EliminationOptions& o,void* leading,void* schur){
+    check_bits(bits);check_size(n,1);Claim<Impl> claim(*impl);void* a=claim.add(A,n*n,complex?"pfaffian_complex A":"pfaffian A");
+    return complex?pfaffian_complex(bits,a,n,out,o,leading,schur):pfaffian(bits,a,n,out,o,leading,schur);
+}
 Timing Linalg::solve_buffers(int bits,int passes,const detail::Operand& L,std::size_t n,const detail::Operand& B,std::size_t nrhs,const detail::Operand& X,const FactorOptions& o){
     check_bits(bits);check_size(n,nrhs);if(L.storage&&(L.storage==B.storage||L.storage==X.storage))throw std::invalid_argument("triangular solve: X and B must not be L");
     Claim<Impl> claim(*impl);void* l=claim.add(L,n*n,"solve L");void* b=claim.add(B,n*nrhs,"solve B");void* x=claim.add(X,n*nrhs,"solve X");

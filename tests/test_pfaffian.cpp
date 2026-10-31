@@ -82,6 +82,11 @@ template<int B,class R> void accuracy(Linalg& la,std::mt19937_64& rng,const std:
     EliminationOptions s=o;s.stop_at=k;std::vector<T> S((n-k)*(n-k));pf<B,R>(la,A,n,&lead,s,nullptr,S.data());pf<B,R>(la,S,n-k,&sv,o);
     require(close_t<B,R>(R::product(lead,sv),v),what+": Pf(A) != Pf(leading) Pf(Schur)");
 }
+template<int B,class R> void buffers(std::mt19937_64& rng,const std::string& what){
+    using T=typename R::T;Engine e;Linalg la(e);const std::size_t n=40;auto A=skew<R>(n,rng,5);EliminationOptions o;o.block=8;o.host_macs=0;o.bounds={10,40};
+    auto buf=e.make_buffer<T>(n*n);buf.upload(A.data(),n*n);T v1,v2;std::vector<T> l1(2),l2(2);la.pfaffian(buf,n,&v1,o,l1.data());pf<B,R>(la,A,n,&v2,o,l2.data());
+    require(same(v1,v2)&&same(l1[0],l2[0])&&same(l1[1],l2[1]),what+": buffer Pfaffian differs");
+}
 template<int B,class R> void suite(const char* label){
     using T=typename R::T;std::mt19937_64 rng(23+B+R::complex);Linalg la;const std::string w=std::string(label)+" bits="+std::to_string(B);
     for(std::size_t n:{0,1,2,3,4,7,10,36,64,71})for(std::size_t nb:{0,2,3,8,16,32}){
@@ -96,7 +101,7 @@ template<int B,class R> void suite(const char* label){
         auto Z=skew<R>(n,rng,5);for(std::size_t i=0;i<n;++i)for(std::size_t j=0;j<i;++j)if(i==12||j==12)Z[i*n+j]=R::zeros();check<B,R>(la,Z,n,8,{},0,w+" zero row and column");
         check<B,R>(la,Z,n,8,{6,12,14,20,40},0,w+" zero pivot in a segment");
         T v;auto info=pf<B,R>(la,Z,n,&v,EliminationOptions{});require(R::is_zero(v)&&!R::status(v)&&info.zero_pivot<n,w+": zero column: Pf != 0 or no zero pivot");}
-    accuracy<B,R>(la,rng,w);
+    accuracy<B,R>(la,rng,w);buffers<B,R>(rng,w);
     std::cout<<w<<": Pfaffians, leading Pfaffians and Schur complements match the MPFR replay; GPU and host agree; Pf^2 = det\n";
 }
 int main(){try{suite<256,RR<256>>("real");suite<1152,RR<1152>>("real");suite<256,RC<256>>("complex");suite<1152,RC<1152>>("complex");return 0;}

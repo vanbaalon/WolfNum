@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add Buffer forms of `factor_lu`, `factor_lu_complex` and `pfaffian` (real or complex buffers),
+  bit-identical to the host-array calls (tested). Record a width table (128–256 bits) for products,
+  Pfaffians and complex LU in `docs/performance.md`.
+
 - Add mixed-precision iterative refinement `LUFactor::solve_refined` (`LIMBFORGE_REFINEMENT_API`): a
   lower-width factor, exact full-width residuals (gemm / gemm_complex) and widened corrections, with
   per-step residual exponents. Validation: refinement from 128/256-bit factors to 256/1152 bits,

@@ -1049,6 +1049,13 @@ run the real sequences step for step. Only the elementary operations change:
 | 1024 | 1.7 s (0.15 s GPU) | 1.0 s |
 | 2048 | 4.7 s (3.5 s host panel) | 6.1 s (2.7 s GPU) |
 
+**Buffer forms.** `factor_lu(const Buffer<T>&, n, options)`, `factor_lu_complex(const Buffer<T>&, …)` and
+`pfaffian(const Buffer<T>&, n, out, options, leading, schur)` take a real or complex buffer: for
+example, a matrix assembled on the GPU with broadcast operands and `congruence`. The rules are those
+of the Cholesky and QR buffer forms: synchronous, the buffer idle and owned by the call until it
+returns, results bit-identical to the host-array calls. `out`, `leading` and `schur` stay host
+pointers.
+
 **Validation.** `tests/test_lu.cpp` and `tests/test_pfaffian.cpp` run every real case for complex
 matrices too, against MPC-style replays in MPFR (`tests/element_reference.hpp`). They also check
 `|det A|^2` against the determinant of the real embedding `[[Re, -Im], [Im, Re]]` and LU solutions

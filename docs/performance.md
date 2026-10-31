@@ -251,3 +251,22 @@ experiments. Files named `round3_rejected*` contain an incomplete failed benchma
 `round5_*` trials stop after GPU test failures. They are not accepted speedup
 records. Historical `m5_max_arithmetic.csv` and the optional application comparison
 predate this standalone benchmark workflow and are excluded from the tables above.
+
+## Dense factorization widths (unreleased APIs)
+
+Time for one call at 128–256 bits, measured once each with `nice` on a loaded Apple M5 Max host
+(single runs, after warm-up). Use it to choose a production width, not as a benchmark record. The
+inputs are random, well-scaled matrices. `gemm` and `gemm_complex` are n = 4096 square products;
+the Pfaffian is real skew; complex LU is `factor_lu_complex`. All use default options (block 32).
+
+| bits | gemm 4096 | gemm_complex 4096 | pfaffian 2048 | pfaffian 4096 | complex LU 2048 | complex LU 4096 |
+|---|---|---|---|---|---|---|
+| 128 | 0.59 s | 2.89 s | 0.90 s | 3.61 s | 3.62 s | 12.07 s |
+| 160 | 0.42 s | 3.13 s | 1.13 s | 3.92 s | 3.30 s | 13.91 s |
+| 192 | 0.48 s | 3.47 s | 0.97 s | 4.45 s | 3.67 s | 15.26 s |
+| 256 | 0.64 s | 6.20 s | 1.30 s | 5.54 s | 3.42 s | 19.09 s |
+
+At n = 4096, 128 bits saves about 17–21% against 192 bits for complex products, Pfaffians and complex
+LU. The real product shows no clear trend at this noise level. The factorizations are dominated
+by their host panels, whose cost grows slowly with width; see "LU factorization" and "Pivoting
+segments" in `numerics.md`.
