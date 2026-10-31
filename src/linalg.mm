@@ -570,6 +570,16 @@ Timing Linalg::Impl::run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,s
     // Assembly: GPU outputs, trivial zeros with statuses, and exact host dots for fallback lines.
     t=Clock::now();std::atomic<std::size_t> next{0},gpu_count{0},multi_count{0},fallback_count{0},trivial_count{0};std::atomic<double> fallback_time{0};
     const unsigned char* o=out?static_cast<const unsigned char*>(out.contents)+out_offset:nullptr;auto* c=static_cast<unsigned char*>(C);DotFn dot=dot_function(N);
+    // Nothing to assemble when the GPU wrote C in place and every line is on the GPU (zero and status lines write canonical
+    // zeros, also over an old status in an update): only the counts, from prefix sums over the columns.
+    {bool skip=out&&report.zero_copy_output&&!ls.fallback&&!rs.fallback;
+     for(const Side* side:{static_cast<const Side*>(&ls),&rs})for(std::size_t i=0;skip&&i<side->cls.size();++i)if(side->cls[i]!=0)skip=false;
+     if(skip){std::vector<std::size_t> g0(Nc+1,0),gm(Nc+1,0);
+        for(std::size_t j=0;j<Nc;++j){const bool gj=rs.cls[j]==0;g0[j+1]=g0[j]+gj;gm[j+1]=gm[j]+(gj&&rs.line[j].bands>1);}
+        std::size_t g=0,mu=0,tr=0;
+        for(std::size_t i=0;i<M;++i){const std::size_t lo=tri==2?std::min(Nc,i<<col_shift):0,hi=tri==1?std::min(Nc,(i+1)<<col_shift):Nc;if(lo>=hi)continue;
+            if(ls.cls[i]!=0){tr+=hi-lo;continue;}const std::size_t gi=g0[hi]-g0[lo];g+=gi;tr+=hi-lo-gi;mu+=ls.line[i].bands>1?gi:gm[hi]-gm[lo];}
+        next=M;gpu_count=g;multi_count=mu;trivial_count=tr;}}
     auto worker=[&](std::size_t,std::size_t){std::size_t g=0,mu=0,fb=0,tr=0;double ft=0;
         for(std::size_t i;(i=next.fetch_add(1))<M;)for(std::size_t j=tri==2?i<<col_shift:0;j<(tri==1?std::min(Nc,(i+1)<<col_shift):Nc);++j){
             unsigned char* dst=c+(i*stride+j)*eb;std::uint8_t ci=ls.cls[i],cj=rs.cls[j];

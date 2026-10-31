@@ -8,7 +8,9 @@
   (best of 3, K = 32): 1.6× (128 bits), 1.8× (192), 2× (512) and 1.17× (1024) lower product GPU
   time. Add `LIMBFORGE_LINALG_STAGES` (profiling only) and `LinalgReport::digits_seconds`,
   `residue_seconds`, `reconstruct_seconds`. Validation: dense product, GEMM spec, resident,
-  Cholesky, QR, complex QR, LU and Pfaffian suites pass bit for bit against MPFR.
+  Cholesky, QR, complex QR, LU and Pfaffian suites pass bit for bit against MPFR. Products written
+  in place with every line on the GPU (the factorization updates) skip the per-entry host assembly:
+  the update's host overhead in a Pfaffian (n = 4096, block 64) fell from 0.7–0.8 s to 0.1–0.3 s.
 
 - Add two-level blocking for Pfaffians (`EliminationOptions::inner_block`, opt-in, rounded up to even;
   previously rejected). Inner blocks are flushed into the panel as exact triangular products. An
