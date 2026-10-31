@@ -183,6 +183,10 @@ if(BUILD_TESTING)
     add_executable(test_wolfnum_lu tests/test_lu.cpp)
     target_link_libraries(test_wolfnum_lu PRIVATE limbforge_reference)
     add_test(NAME linalg_lu COMMAND test_wolfnum_lu)
+    # Pfaffians (blocked Parlett-Reid) against an MPFR replay of the same rounding sequence.
+    add_executable(test_wolfnum_pfaffian tests/test_pfaffian.cpp)
+    target_link_libraries(test_wolfnum_pfaffian PRIVATE limbforge_reference)
+    add_test(NAME linalg_pfaffian COMMAND test_wolfnum_pfaffian)
     # Diagnostic only (plan A2): not a CTest; compares GPU product formulations with the CPU.
     add_executable(gpu_codegen_probe tests/gpu_codegen_probe.mm)
     target_include_directories(gpu_codegen_probe PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")

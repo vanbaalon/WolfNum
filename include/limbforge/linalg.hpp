@@ -2,6 +2,7 @@
 #define LIMBFORGE_GPU_REQUIRED_GEMM_API 1
 #define LIMBFORGE_GEMM_SPEC_API 1
 #define LIMBFORGE_LU_API 1
+#define LIMBFORGE_PFAFFIAN_API 1
 // Dense real products with one rounding per output (plan D6 via L1c): C[i][j] = RN(sum_k L[i][k]*R[k][j]),
 // or RN(C[i][j] - sum_k ...) as an update, computed exactly by an integer GEMM over residues (Metal TensorOps
 // int8) and rounded once, ties to even. Contract and algorithm: docs/numerics.md, "Dense products". Host arrays, and
@@ -134,6 +135,16 @@ struct LUInfo {
     std::size_t blocks=0,gpu_updates=0,host_updates=0;
     double panel_seconds=0,update_seconds=0;  // host panels and U rows; trailing updates (GPU or host), wall
 };
+// Pfaffian of a real skew-symmetric matrix by blocked Parlett-Reid elimination with pivoting (docs/numerics.md, "Pfaffian").
+// FactorOptions: block = columns per block (rounded up to even; 0 = one block), host_macs and gpu as Cholesky; the value depends
+// on block only. zero_pivot: the step column k whose pivot candidates are all zero (n if none; Pf = 0 exactly). status_column:
+// the step column whose candidates carry a status (n if none; Pf = zero with status, the OR of those statuses). sign: det(P).
+struct PfaffianInfo {
+    std::size_t zero_pivot=0,status_column=0; word status=0; int sign=1;
+    Timing timing{0,0};
+    std::size_t blocks=0,gpu_updates=0,host_updates=0;
+    double panel_seconds=0,update_seconds=0;
+};
 namespace detail { struct LUData; }
 // Owning LU factor of an n x n matrix. Like QRFactor it copies what it needs, uses the Linalg that made it (which must outlive
 // it) and follows the Linalg threading rule.
@@ -242,6 +253,10 @@ public:
     Timing cholesky_solve(int bits,const void* L,std::size_t n,const void* B,std::size_t nrhs,void* X,const FactorOptions& options={});
     // LU with partial pivoting of A (n x n, row-major); A is only read. See LUFactor.
     LUFactor factor_lu(int bits,const void* A,std::size_t n,const FactorOptions& options={});
+    // Pf(A) for skew-symmetric A (n x n, row-major): only the strict lower triangle is read (A_ij = -A_ji is assumed). Writes one
+    // Float<bits> to out: sign * a_0 * a_2 * ... (a_k = the k-th step's pivot entry), rounded after each multiplication. n = 0
+    // gives 1; odd n gives zero with the OR of the lower entries' statuses. See PfaffianInfo and docs/numerics.md.
+    PfaffianInfo pfaffian(int bits,const void* A,std::size_t n,void* out,const FactorOptions& options={});
     // Householder QR of A (m x n, row-major, m >= n); A is only read. info().rank reports rank deficiency.
     QRFactor factor_qr(int bits,const void* A,std::size_t m,std::size_t n,const QROptions& options={});
     // QR of the augmented Levenberg-Marquardt matrix [J; diag(d)] ((m+n) x n) for J (m x n) and the caller's diagonal d

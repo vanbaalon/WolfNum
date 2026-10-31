@@ -254,6 +254,7 @@ struct Linalg::Impl {
     // Blocked LU with partial pivoting (lu_n) and its solve (lu_solve_n); docs/numerics.md, "LU factorization".
     template<int N> void lu_n(const Number<N>* A,std::size_t n,detail::LUData& f);
     template<int N> Timing lu_solve_n(const detail::LUData& f,const Number<N>* B,std::size_t nrhs,Number<N>* X);
+    template<int N> PfaffianInfo pfaffian_n(const Number<N>* A,std::size_t n,Number<N>& out,const FactorOptions& fo);
     // Householder QR (qr_n), one compact-WY block applied to columns [c0, c1) of X (qr_block), Q or Q^T applied to C (qr_apply_n).
     template<int N> void qr_n(const Number<N>* A,std::size_t m,std::size_t n,detail::QRData& f);
     template<int N> Timing qr_block(const detail::QRData& f,std::size_t b,Number<N>* X,std::size_t ld,std::size_t c0,std::size_t c1,bool qt,Number<N>* Wb,Number<N>* Yb,double threshold,bool gpu,bool& on_gpu,bool have_y=false);
@@ -693,6 +694,54 @@ template<int N> Timing Linalg::Impl::lu_solve_n(const detail::LUData& f,const Nu
     const Timing a=solve_n<N>(F,n,X,nrhs,X,fo,1,false,true),b=solve_n<N>(F,n,X,nrhs,X,fo,2,true);
     timing.gpu_seconds=a.gpu_seconds+b.gpu_seconds;timing.wall_seconds=since(start);return timing;
 }
+// ---- Pfaffian: blocked Parlett-Reid (docs/numerics.md, "Pfaffian") ----
+// Lower storage W (i > j). Step k (even) eliminates columns k, k+1: a = A[k][k+1] = -W[k+1][k], x_i = W[i][k], y_i = W[i][k+1]
+// (i >= k+2), tau_i = RN(x_i / a), and the Schur complement is S_ic = A_ic - (tau_i y_c - y_i tau_c) = A_ic - P_i . Q_c with
+// P_i = [tau_i, y_i, ...] and Q_c = [y_c, -tau_c, ...] (two terms per step of the block). Entries of the block's later columns take
+// the block's pending terms lazily (one rounding: D over the steps so far); at the end of the block the trailing lower triangle
+// takes them as one exact product (GPU) or exact dots (host), identical bits. Pf(A) = det(P) * prod_k a_k.
+template<int N> PfaffianInfo Linalg::Impl::pfaffian_n(const Number<N>* A,std::size_t n,Number<N>& out,const FactorOptions& fo){@autoreleasepool{
+    using T=Number<N>;auto start=Clock::now();PfaffianInfo info;info.zero_pivot=info.status_column=n;pool_workers();
+    if(n%2){word st=0;for(std::size_t i=0;i<n;++i)for(std::size_t j=0;j<i;++j)st|=A[i*n+j].status;out=zero<N>(st);info.timing.wall_seconds=since(start);return info;}
+    out=zero<N>();out.limb[N-1]=0x80000000u;out.sign=1;if(!n){info.timing.wall_seconds=since(start);return info;}
+    const std::size_t nb=fo.block?std::min(n,(fo.block+1)/2*2):n,h=nb/2;
+    detail::PageBlock store(n*n*sizeof(T));T* W=static_cast<T*>(store.p);Residency keep(*this);
+    each(n,[&](std::size_t i){for(std::size_t j=0;j<i;++j)W[i*n+j]=A[i*n+j];});
+    const bool gpu=fo.gpu&&n>nb&&double(n-nb)*double(n-nb)/2*double(nb)>=fo.host_macs;
+    id<MTLBuffer> pb=buffer("pfaffian_p",n*nb*sizeof(T)),qb=buffer("pfaffian_q",n*nb*sizeof(T));T* P=static_cast<T*>(pb.contents);T* Q=static_cast<T*>(qb.contents);
+    if(gpu){id<MTLBuffer> b=wrap(W,n*n*sizeof(T));if(!b)throw std::runtime_error("Metal buffer wrap failed (pfaffian)");resident.push_back(b);resident.push_back(pb);resident.push_back(qb);}
+    auto D=[&](const T& c,std::size_t i,std::size_t j,std::size_t K){return exact_dot_add<N>(&c,true,P+i*nb,1,Q+j*nb,1,K);};
+    // Symmetric exchange of indices a < b among the active indices >= k (column k is the only finished column still read).
+    auto exchange=[&](std::size_t k,std::size_t a,std::size_t b){
+        for(std::size_t j=k;j<a;++j)std::swap(W[a*n+j],W[b*n+j]);
+        for(std::size_t i=a+1;i<b;++i){T t=W[i*n+a];W[i*n+a]=negate(W[b*n+i]);W[b*n+i]=negate(t);}
+        W[b*n+a]=negate(W[b*n+a]);
+        for(std::size_t i=b+1;i<n;++i)std::swap(W[i*n+a],W[i*n+b]);
+        std::swap_ranges(P+a*nb,P+a*nb+nb,P+b*nb);std::swap_ranges(Q+a*nb,Q+a*nb+nb,Q+b*nb);};
+    bool first=true;
+    for(std::size_t k0=0;k0<n;k0+=nb){auto t=Clock::now();++info.blocks;std::size_t s=0,k=k0;
+        for(;k<std::min(n,k0+nb);k+=2,++s){
+            each(n-k-1,[&](std::size_t r){const std::size_t i=k+1+r;W[i*n+k]=D(W[i*n+k],i,k,2*s);});
+            word st=0;std::size_t p=k+1;for(std::size_t i=k+1;i<n;++i){st|=W[i*n+k].status;if(magnitude_compare(W[i*n+k],W[p*n+k])>0)p=i;}
+            if(st){info.status_column=k;info.status=st;out=zero<N>(st);info.panel_seconds+=since(t);info.timing.wall_seconds=since(start);return info;}
+            if(!W[p*n+k].sign){info.zero_pivot=k;out=zero<N>();info.panel_seconds+=since(t);info.timing.wall_seconds=since(start);return info;}
+            if(p!=k+1){exchange(k,k+1,p);info.sign=-info.sign;}
+            const T a=negate(W[(k+1)*n+k]);out=first?a:mul(out,a);first=false;
+            each(n-k-2,[&](std::size_t r){const std::size_t i=k+2+r;T& y=W[i*n+k+1];y=D(y,i,k+1,2*s);
+                const T tau=div(W[i*n+k],a);P[i*nb+2*s]=tau;P[i*nb+2*s+1]=y;Q[i*nb+2*s]=y;Q[i*nb+2*s+1]=negate(tau);});
+        }
+        info.panel_seconds+=since(t);
+        if(k>=n)break;
+        t=Clock::now();const std::size_t m=n-k,K=2*s;const bool on_gpu=gpu&&double(m)*double(m)/2*double(K)>=fo.host_macs;
+        if(on_gpu){auto* pp=reinterpret_cast<const unsigned char*>(P+k*nb);auto* qq=reinterpret_cast<const unsigned char*>(Q+k*nb);
+            Timing tm=run(32*N,View{pp,sizeof(T),nb,1,N},View{qq,sizeof(T),nb,1,N},m,m,K,W+k*n+k,false,false,true,n,false,false,1);
+            info.timing.gpu_seconds+=tm.gpu_seconds;++info.gpu_updates;}
+        else{each(m,[&](std::size_t r){const std::size_t i=k+r;for(std::size_t c=k;c<i;++c)W[i*n+c]=D(W[i*n+c],i,c,K);});++info.host_updates;}
+        info.update_seconds+=since(t);
+    }
+    if(info.sign<0)out=negate(out);
+    info.timing.wall_seconds=since(start);return info;
+}}
 // ---- Householder QR (docs/numerics.md, "QR factorization and least squares") ----
 // P(x, y; S) = RN(sum x_k y_k) and D(c; x, y; S) = RN(c - sum x_k y_k), one rounding each (exact_dot / exact_dot_add or
 // the GPU products: identical bits). Block b holds reflectors [k0, k0+kb), k0 = b nb; V_b, T_b as stored in the factor.
@@ -1000,6 +1049,11 @@ Timing Linalg::cholesky_solve(int bits,const void* L,std::size_t n,const void* B
     check_bits(bits);check_size(n,nrhs);if(n&&nrhs&&(!L||!B||!X))throw std::invalid_argument("null matrix");
     return by_words(bits/32,[&](auto w){constexpr int N=decltype(w)::value;
         return impl->solve_n<N>(static_cast<const Number<N>*>(L),n,static_cast<const Number<N>*>(B),nrhs,static_cast<Number<N>*>(X),o,3);});
+}
+PfaffianInfo Linalg::pfaffian(int bits,const void* A,std::size_t n,void* out,const FactorOptions& o){
+    check_bits(bits);check_size(n,1);if(n&&!A)throw std::invalid_argument("null matrix");if(!out)throw std::invalid_argument("null output");
+    return by_words(bits/32,[&](auto w){constexpr int N=decltype(w)::value;Number<N> r;PfaffianInfo info=impl->pfaffian_n<N>(static_cast<const Number<N>*>(A),n,r,o);
+        std::memcpy(out,&r,sizeof r);return info;});
 }
 LUFactor Linalg::factor_lu(int bits,const void* A,std::size_t n,const FactorOptions& o){
     check_bits(bits);check_size(n,1);if(n&&!A)throw std::invalid_argument("null matrix");

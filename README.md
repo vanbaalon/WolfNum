@@ -88,6 +88,8 @@ measurements.
   [strided, signed and triangular products](docs/numerics.md#strided-signed-and-triangular-products).
 - **Unreleased:** blocked LU with partial pivoting (`Linalg::factor_lu`): solves and determinants with a
   documented rounding sequence and GPU trailing updates; see [LU factorization](docs/numerics.md#lu-factorization).
+- **Unreleased:** Pfaffians of real skew-symmetric matrices (`Linalg::pfaffian`, blocked Parlett–Reid with GPU skew
+  updates); see [Pfaffian](docs/numerics.md#pfaffian).
 - Real and complex Householder QR, optional column pivoting, reusable least-squares factors,
   multiple-right-hand-side solves and Q application (`linalg.hpp`). QR uses host panels
   and GPU/host updates; see [QR contracts](docs/numerics.md#qr-factorization-and-least-squares).

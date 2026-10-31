@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add Pfaffians of real skew-symmetric matrices (`LIMBFORGE_PFAFFIAN_API`): `Linalg::pfaffian`, blocked
+  Parlett-Reid with pivoting and GPU skew trailing updates (triangular exact products). The rounding
+  sequence depends only on the block size. Validation: `tests/test_pfaffian.cpp` (new) replays it in
+  MPFR at 256/1152 bits bit for bit, with GPU/host agreement and Pf^2 = det(A) to working accuracy.
+
 - Add blocked LU with partial pivoting (`LIMBFORGE_LU_API`): `Linalg::factor_lu`, `LUFactor` with
   `solve`, `determinant`, permutation and sign. The documented rounding sequence (one exact-dot
   rounding per block, as Cholesky) depends only on the block size; trailing updates run on the GPU.

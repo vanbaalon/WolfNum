@@ -905,6 +905,53 @@ rows take about two thirds of the wall time. They run before each trailing updat
 look-ahead overlap Cholesky uses (possible later: it needs deferred row swaps and changes no bits).
 Complex LU is not yet available.
 
+## Pfaffian
+
+`Linalg::pfaffian` (unreleased; `LIMBFORGE_PFAFFIAN_API`) computes `Pf(A)` of a real skew-symmetric
+matrix by blocked Parlett–Reid elimination with pivoting:
+
+```cpp
+Float<256> pf;
+PfaffianInfo info = la.pfaffian(bits, A, n, &pf);   // FactorOptions: block (even), host_macs, gpu
+```
+
+Only the strict lower triangle of A is read (`A_ij = -A_ji` is assumed; the diagonal is zero).
+`n = 0` gives 1. Odd `n` gives zero with the OR of the lower entries' statuses.
+
+**Rounding sequence.** Step `k` (even) eliminates columns `k` and `k + 1` with `a = A[k][k+1]`,
+`x_i = A[i][k]` and `y_i = A[i][k+1]` for `i >= k + 2`. Then `Pf(A) = a · Pf(S)`, where
+`S_ic = A_ic - (tau_i y_c - y_i tau_c)` and `tau_i = RN(x_i / a)`. A block of `nb` columns holds
+`nb/2` steps, whose terms are packed as `P_i = [tau_i, y_i, ...]` and `Q_c = [y_c, -tau_c, ...]`. With
+`D(c; P_i, Q_c; S) = RN(c - sum_S P_i Q_c)`, one rounding of the exact value:
+
+1. **Column k:** the candidates `A[i][k] = D(A[i][k]; P_i, Q_k; steps of this block so far)`, `i > k`.
+2. **Pivot:** the largest candidate magnitude, by exact comparison with ties to the lowest index.
+   Indices `k + 1` and the pivot are exchanged symmetrically, which negates entries that cross the
+   diagonal and swaps the packed terms; each exchange flips the sign.
+3. **Column k + 1:** `y_i = D(A[i][k+1]; P_i, Q_{k+1}; steps so far)`; then `tau_i = RN(x_i / a)`.
+4. **Trailing update:** at the end of the block, the trailing lower triangle takes
+   `D(A_ic; P_i, Q_c; all steps of the block)`. It runs as one exact product with triangular output
+   on the GPU, skipping off-triangle residue tiles, or as host exact dots; the two give identical
+   bits, so the value depends on `block` only.
+5. **Value:** `Pf = sign · a_0 · a_2 · ...`, rounded after each multiplication in step order
+   (`n/2 - 1` roundings).
+
+**Outcomes.** A step whose candidates are all zero gives `Pf = 0` exactly (`info.zero_pivot`). A
+status among the candidates stops with zero carrying the OR of those statuses
+(`info.status_column`). A status that enters the trailing matrix through `y` reaches the candidates
+of a later step.
+
+**Validation.** `tests/test_pfaffian.cpp` replays the sequence in MPFR on full skew storage,
+applying every block's terms lazily when an entry is read; the driver applies them eagerly on lower
+storage. It requires bitwise agreement at 256 and 1152 bits for sizes 0–71 (odd and even) with
+blocks 2–32 and a single block, plus status, zero-row and block-diagonal inputs. GPU and host
+updates must agree, and `Pf^2` must agree with `det(A)` from `factor_lu` to `2^-(bits-40)`.
+
+**Measured** (256 bits, block 32, loaded M5 Max host): n = 1024 takes 0.35 s and n = 2048 takes
+1.31 s (0.31 s GPU). The host panel takes about two thirds of the time, as for LU. Complex
+Pfaffians are not yet available; they need the complex host steps, and their trailing updates can
+use `gemm_complex`.
+
 ## Polynomial values and jets
 
 ```cpp
