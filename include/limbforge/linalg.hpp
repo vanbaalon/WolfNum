@@ -135,6 +135,16 @@ struct LUInfo {
     std::size_t blocks=0,gpu_updates=0,host_updates=0;
     double panel_seconds=0,update_seconds=0;  // host panels and U rows; trailing updates (GPU or host), wall
 };
+// Pivoting segments and partial elimination for factor_lu(_complex) and pfaffian(_complex) (docs/numerics.md, "Pivoting
+// segments and partial elimination"). bounds: strictly increasing, in (0, n] (even for Pfaffians); the pivot for column
+// (step) j is chosen only among rows (indices) before the first bound > j, so every leading submatrix [0, b) is factored on
+// its own and its determinant / Pfaffian is reported. stop_at = k > 0 eliminates columns [0, k) only (pivots within [0, k),
+// a block ends at k; bounds must not exceed k) and keeps the Schur complement in original order: D - C A^-1 B (LU) or
+// R + Q^T P^-1 Q (skew, for A = [P Q; -Q^T R]). Without either option the factorizations are unchanged.
+struct EliminationOptions : FactorOptions {
+    std::vector<std::size_t> bounds;
+    std::size_t stop_at=0;
+};
 // Pfaffian of a real skew-symmetric matrix by blocked Parlett-Reid elimination with pivoting (docs/numerics.md, "Pfaffian").
 // FactorOptions: block = columns per block (rounded up to even; 0 = one block), host_macs and gpu as Cholesky; the value depends
 // on block only. zero_pivot: the step column k whose pivot candidates are all zero (n if none; Pf = 0 exactly). status_column:
@@ -153,7 +163,17 @@ public:
     LUFactor(); ~LUFactor(); LUFactor(LUFactor&&) noexcept; LUFactor& operator=(LUFactor&&) noexcept;
     bool empty() const; int bits() const; std::size_t size() const; std::size_t block() const;
     const LUInfo& info() const; bool nonsingular() const;   // no zero pivot and no status column
-    // Row-major Float<bits> n x n owned by the factor: strictly lower part = L (unit diagonal not stored), upper part = U.
+    bool is_complex() const;                 // from factor_lu_complex: lu(), solve and determinant use Complex<bits/32>
+    std::size_t eliminated() const;          // columns eliminated: size(), or EliminationOptions::stop_at
+    const std::vector<std::size_t>& bounds() const;
+    // det of each leading submatrix [0, b) for b in bounds(): bounds().size() values (Float<bits()> or Complex) written
+    // to out, each the running pivot product of determinant() at that column with the permutation sign so far. After a zero
+    // pivot in column j, bounds beyond j's segment get zero with status invalid (restricted pivoting cannot factor them).
+    void leading_determinants(void* out) const;
+    // The Schur complement of a partial elimination: (size() - eliminated())^2 entries, row-major, original row/column order.
+    void schur(void* out) const;
+    // Row-major Float<bits> (complex factor: Complex<bits/32>) n x n owned by the factor: strictly lower part = L (unit
+    // diagonal not stored), upper part = U.
     const void* lu() const;
     const std::size_t* permutation() const;  // row i of P A is row permutation()[i] of A
     int permutation_sign() const;            // det(P) = +1 or -1
@@ -162,7 +182,9 @@ public:
     // everywhere. X must not overlap B.
     Timing solve(const void* B,std::size_t nrhs,void* X) const;
     // det(A) = permutation_sign() * u_00 * u_11 * ... * u_{n-1,n-1}, the product rounded after each multiplication in index
-    // order (n - 1 roundings; empty matrix: 1). Writes one Float<bits()> to out. A status column gives zero with status invalid.
+    // order (n - 1 roundings; empty matrix: 1; complex: each component of each product rounded once). Writes one Float<bits()>
+    // (or Complex) to out. A status column gives zero with status invalid. After a partial elimination: det of the leading
+    // eliminated() block. solve requires a complete factorization (logic_error otherwise).
     void determinant(void* out) const;
 private:
     friend class Linalg; std::unique_ptr<detail::LUData> d;
@@ -252,11 +274,22 @@ public:
     // X solves (L L^T) X = B: trsm, then trsm with transpose.
     Timing cholesky_solve(int bits,const void* L,std::size_t n,const void* B,std::size_t nrhs,void* X,const FactorOptions& options={});
     // LU with partial pivoting of A (n x n, row-major); A is only read. See LUFactor.
-    LUFactor factor_lu(int bits,const void* A,std::size_t n,const FactorOptions& options={});
+    LUFactor factor_lu(int bits,const void* A,std::size_t n,const EliminationOptions& options={});
+    // Complex LU (A: Complex<bits/32>): the same sequence with complex exact dots (one rounding per component), pivots by exact
+    // comparison of |s_ij|^2, and l_ij = s_ij / u_jj by the documented complex division (docs/numerics.md, "Complex LU and
+    // Pfaffians"). The factor's solve runs on host threads.
+    LUFactor factor_lu_complex(int bits,const void* A,std::size_t n,const EliminationOptions& options={});
     // Pf(A) for skew-symmetric A (n x n, row-major): only the strict lower triangle is read (A_ij = -A_ji is assumed). Writes one
     // Float<bits> to out: sign * a_0 * a_2 * ... (a_k = the k-th step's pivot entry), rounded after each multiplication. n = 0
-    // gives 1; odd n gives zero with the OR of the lower entries' statuses. See PfaffianInfo and docs/numerics.md.
-    PfaffianInfo pfaffian(int bits,const void* A,std::size_t n,void* out,const FactorOptions& options={});
+    // gives 1; odd n gives zero with the OR of the lower entries' statuses. See PfaffianInfo and docs/numerics.md. With
+    // EliminationOptions: out = Pf of the eliminated leading block [0, stop_at) (whole matrix by default); leading (if not
+    // null) receives Pf of each leading submatrix [0, b), b in bounds; schur (if not null, stop_at > 0) receives the
+    // (n - stop_at)^2 skew Schur complement R + Q^T P^-1 Q, row-major with both triangles. A zero pivot at step k gives Pf 0
+    // for the leading blocks up to k's segment end and zero with status invalid beyond it.
+    PfaffianInfo pfaffian(int bits,const void* A,std::size_t n,void* out,const EliminationOptions& options={},void* leading=nullptr,void* schur=nullptr);
+    // Complex skew-symmetric A (Complex<bits/32>; A_ij = -A_ji, no conjugation): the same sequence with complex steps; writes one
+    // Complex<bits/32> to out (the product rounded once per component after each multiplication).
+    PfaffianInfo pfaffian_complex(int bits,const void* A,std::size_t n,void* out,const EliminationOptions& options={},void* leading=nullptr,void* schur=nullptr);
     // Householder QR of A (m x n, row-major, m >= n); A is only read. info().rank reports rank deficiency.
     QRFactor factor_qr(int bits,const void* A,std::size_t m,std::size_t n,const QROptions& options={});
     // QR of the augmented Levenberg-Marquardt matrix [J; diag(d)] ((m+n) x n) for J (m x n) and the caller's diagonal d

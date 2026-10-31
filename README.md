@@ -90,6 +90,10 @@ measurements.
   documented rounding sequence and GPU trailing updates; see [LU factorization](docs/numerics.md#lu-factorization).
 - **Unreleased:** Pfaffians of real skew-symmetric matrices (`Linalg::pfaffian`, blocked Parlett–Reid with GPU skew
   updates); see [Pfaffian](docs/numerics.md#pfaffian).
+- **Unreleased:** complex LU and Pfaffians (`factor_lu_complex`, `pfaffian_complex`), leading determinants/Pfaffians
+  at caller bounds and Schur complements from one factorization; see
+  [complex LU and Pfaffians](docs/numerics.md#complex-lu-and-pfaffians) and
+  [pivoting segments](docs/numerics.md#pivoting-segments-and-partial-elimination).
 - Real and complex Householder QR, optional column pivoting, reusable least-squares factors,
   multiple-right-hand-side solves and Q application (`linalg.hpp`). QR uses host panels
   and GPU/host updates; see [QR contracts](docs/numerics.md#qr-factorization-and-least-squares).

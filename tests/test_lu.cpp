@@ -1,79 +1,120 @@
-// Blocked LU with partial pivoting (Linalg::factor_lu, LUFactor::solve / determinant) against an independent MPFR replay of the
-// documented rounding sequence (docs/numerics.md, "LU factorization"), bit for bit. The reference is left-looking, column by
-// column: column j receives the U rows and trailing update of each earlier block (reference::dot_sub), then its in-block dots,
-// the pivot search and the divisions (MPFR); whole rows are swapped as the pivots are chosen. GPU and host updates must agree.
+// Blocked LU with partial pivoting, real and complex (Linalg::factor_lu / factor_lu_complex, LUFactor::solve, determinant,
+// leading_determinants, schur) against an independent MPFR replay of the documented rounding sequence (docs/numerics.md, "LU
+// factorization", "Complex LU and Pfaffians", "Pivoting segments and partial elimination"), bit for bit. The reference is
+// left-looking, column by column: column j receives the U rows and trailing update of each earlier block (reference::dot_sub on
+// interleaved terms), then its in-block dots, the pivot search within its segment and the divisions (MPFR); whole rows are swapped
+// as pivots are chosen. Also: GPU and host updates agree; leading determinants equal separate calls on A[0:b, 0:b]; det(A) =
+// det(leading) det(Schur); complex |det|^2 equals the determinant of the real embedding and solves agree with complex QR.
 #include "reference.hpp"
 #include "limbforge/linalg.hpp"
+#include "element_reference.hpp"
 #include <iostream>
 #include <numeric>
 using namespace limbforge;
 void require(bool condition,const std::string& message){if(!condition)throw std::runtime_error(message);}
-template<int B> using F=Float<B>;
-template<class T> bool same(const T& a,const T& b){return std::memcmp(&a,&b,sizeof(T))==0;}
-template<int B> F<B> rdiv(const F<B>& a,const F<B>& b){return reference::real<B>(Operation::div,a,b);}
-template<int B> F<B> rmul(const F<B>& a,const F<B>& b){return reference::real<B>(Operation::mul,a,b);}
-template<int B> struct RefLU {std::vector<F<B>> W;std::vector<std::size_t> perm;int sign=1;std::size_t zero_pivot,status_column;};
-template<int B> RefLU<B> reference_lu(std::vector<F<B>> W,std::size_t n,std::size_t nb){
-    RefLU<B> r;r.perm.resize(n);std::iota(r.perm.begin(),r.perm.end(),0);r.zero_pivot=r.status_column=n;
-    auto at=[&](std::size_t i,std::size_t j)->F<B>&{return W[i*n+j];};
-    auto D=[&](F<B> c,std::size_t i,std::size_t j,std::size_t q0,std::size_t q1){return reference::dot_sub<B>(c,&W[i*n+q0],1,&W[q0*n+j],std::ptrdiff_t(n),q1-q0);};
-    for(std::size_t j=0;j<n;++j){const std::size_t k0=j/nb*nb;
-        for(std::size_t b0=0;b0<k0;b0+=nb){const std::size_t b1=b0+nb;                     // earlier blocks: U rows, then the trailing update
-            for(std::size_t i=b0;i<b1;++i)at(i,j)=D(at(i,j),i,j,b0,i);
-            for(std::size_t i=b1;i<n;++i)at(i,j)=D(at(i,j),i,j,b0,b1);}
-        for(std::size_t i=k0;i<j;++i)at(i,j)=D(at(i,j),i,j,k0,i);
-        for(std::size_t i=j;i<n;++i)at(i,j)=D(at(i,j),i,j,k0,j);
-        word st=0;std::size_t p=j;for(std::size_t i=j;i<n;++i){st|=at(i,j).status;if(magnitude_compare(at(i,j),at(p,j))>0)p=i;}
-        if(st){r.status_column=j;for(std::size_t i=0;i<n;++i)for(std::size_t c=j;c<n;++c)at(i,c)=zero<B/32>(invalid);break;}
+template<class R> struct RefLU {std::vector<typename R::T> W,lead;typename R::T det;std::vector<std::size_t> perm;int sign=1;std::size_t zero_pivot,status_column;};
+template<class R> RefLU<R> reference_lu(std::vector<typename R::T> W,std::size_t n,std::size_t nb,const std::vector<std::size_t>& bounds,std::size_t ke){
+    using T=typename R::T;RefLU<R> r;r.perm.resize(n);std::iota(r.perm.begin(),r.perm.end(),0);r.zero_pivot=r.status_column=n;
+    std::vector<std::size_t> limits=bounds;if(ke<n)limits.push_back(ke);
+    auto seg=[&](std::size_t j){for(auto b:limits)if(b>j)return b;return n;};
+    // Block starts: multiples of nb, plus ke.
+    std::vector<std::size_t> starts;for(std::size_t k=0;k<ke;k=std::min({n,k+nb,ke}))starts.push_back(k);starts.push_back(ke);
+    auto at=[&](std::size_t i,std::size_t j)->T&{return W[i*n+j];};
+    auto D=[&](std::size_t i,std::size_t j,std::size_t q0,std::size_t q1){std::vector<T> x,y;for(std::size_t q=q0;q<q1;++q){x.push_back(at(i,q));y.push_back(at(q,j));}return R::D(at(i,j),x,y);};
+    // Column j (j < ke) or a trailing column (j >= ke): the U rows and trailing updates of the blocks before min(j, ke)'s block.
+    auto block_start=[&](std::size_t j){std::size_t k0=0;for(auto s:starts)if(s<=j)k0=s;return k0;};
+    auto earlier=[&](std::size_t j){const std::size_t limit=j<ke?block_start(j):ke;
+        for(std::size_t b=0;b+1<starts.size()&&starts[b+1]<=limit;++b){const std::size_t b0=starts[b],b1=starts[b+1];
+            for(std::size_t i=b0;i<b1;++i)at(i,j)=D(i,j,b0,i);for(std::size_t i=b1;i<n;++i)at(i,j)=D(i,j,b0,b1);}};
+    T prod=R::one();bool first=true;std::size_t poison=n,bi=0;r.lead.assign(bounds.size(),R::zeros(invalid));std::size_t stop=n;
+    for(std::size_t j=0;j<ke;++j){const std::size_t k0=block_start(j);
+        earlier(j);for(std::size_t i=k0;i<j;++i)at(i,j)=D(i,j,k0,i);for(std::size_t i=j;i<n;++i)at(i,j)=D(i,j,k0,j);
+        const std::size_t e=seg(j);word st=0;std::size_t p=j;for(std::size_t i=j;i<e;++i){st|=R::status(at(i,j));if(R::compare(at(i,j),at(p,j))>0)p=i;}
+        if(st){stop=r.status_column=j;break;}
         if(p!=j){for(std::size_t c=0;c<n;++c)std::swap(at(p,c),at(j,c));std::swap(r.perm[p],r.perm[j]);r.sign=-r.sign;}
-        if(!at(j,j).sign){if(r.zero_pivot==n)r.zero_pivot=j;continue;}
-        for(std::size_t i=j+1;i<n;++i)at(i,j)=rdiv<B>(at(i,j),at(j,j));
-    }
+        prod=first?at(j,j):R::product(prod,at(j,j));first=false;
+        for(;bi<bounds.size()&&bounds[bi]==j+1;++bi)if(j+1<=poison)r.lead[bi]=r.sign<0?R::neg(prod):prod;
+        if(R::is_zero(at(j,j))){if(r.zero_pivot==n)r.zero_pivot=j;poison=std::min(poison,e);continue;}
+        for(std::size_t i=j+1;i<n;++i)at(i,j)=R::quotient(at(i,j),at(j,j));}
+    if(stop<n){for(std::size_t i=0;i<n;++i)for(std::size_t c=stop;c<n;++c)at(i,c)=R::zeros(invalid);}
+    else for(std::size_t j=ke;j<n;++j)earlier(j);   // trailing columns: the U rows and the Schur complement
+    r.det=stop<n||ke>poison?R::zeros(invalid):r.sign<0?R::neg(prod):prod;if(!ke&&stop==n)r.det=R::one();
     r.W=std::move(W);return r;
 }
-// X = P B; unit-lower forward and upper backward substitution, blocked as trsm (one dot_sub per block, then the in-block dot).
-template<int B> std::vector<F<B>> reference_solve(const RefLU<B>& f,const std::vector<F<B>>& Bm,std::size_t n,std::size_t nrhs,std::size_t nb){
-    std::vector<F<B>> X(n*nrhs);const auto& W=f.W;
+template<class R> std::vector<typename R::T> reference_solve(const RefLU<R>& f,const std::vector<typename R::T>& Bm,std::size_t n,std::size_t nrhs,std::size_t nb){
+    using T=typename R::T;std::vector<T> X(n*nrhs);const auto& W=f.W;
     for(std::size_t i=0;i<n;++i)for(std::size_t c=0;c<nrhs;++c)X[i*nrhs+c]=Bm[f.perm[i]*nrhs+c];
-    for(std::size_t c=0;c<nrhs;++c){auto x=[&](std::size_t i)->F<B>&{return X[i*nrhs+c];};
-        for(std::size_t i=0;i<n;++i){const std::size_t r0=i/nb*nb;
-            for(std::size_t b0=0;b0<r0;b0+=nb)x(i)=reference::dot_sub<B>(x(i),&W[i*n+b0],1,&X[b0*nrhs+c],std::ptrdiff_t(nrhs),nb);
-            x(i)=reference::dot_sub<B>(x(i),&W[i*n+r0],1,&X[r0*nrhs+c],std::ptrdiff_t(nrhs),i-r0);}
-        for(std::size_t i=n;i-->0;){const std::size_t r0=i/nb*nb,r1=std::min(n,r0+nb);
-            for(std::size_t b0=(n-1)/nb*nb;b0>r0;b0-=nb){const std::size_t b1=std::min(n,b0+nb);
-                x(i)=reference::dot_sub<B>(x(i),&W[i*n+b0],1,&X[b0*nrhs+c],std::ptrdiff_t(nrhs),b1-b0);}
-            if(i+1<r1)x(i)=reference::dot_sub<B>(x(i),&W[i*n+i+1],1,&X[(i+1)*nrhs+c],std::ptrdiff_t(nrhs),r1-i-1);
-            x(i)=rdiv<B>(x(i),W[i*n+i]);}}
+    auto D=[&](T v,std::size_t i,std::size_t c,std::size_t q0,std::size_t q1){std::vector<T> x,y;for(std::size_t q=q0;q<q1;++q){x.push_back(W[i*n+q]);y.push_back(X[q*nrhs+c]);}return R::D(v,x,y);};
+    for(std::size_t c=0;c<nrhs;++c){
+        for(std::size_t i=0;i<n;++i){const std::size_t r0=i/nb*nb;T v=X[i*nrhs+c];for(std::size_t b0=0;b0<r0;b0+=nb)v=D(v,i,c,b0,b0+nb);X[i*nrhs+c]=D(v,i,c,r0,i);}
+        for(std::size_t i=n;i-->0;){const std::size_t r0=i/nb*nb,r1=std::min(n,r0+nb);T v=X[i*nrhs+c];
+            for(std::size_t b0=(n-1)/nb*nb;b0>r0;b0-=nb)v=D(v,i,c,b0,std::min(n,b0+nb));
+            if(i+1<r1)v=D(v,i,c,i+1,r1);X[i*nrhs+c]=R::quotient(v,W[i*n+i]);}}
     return X;
 }
-template<int B> std::vector<F<B>> random_matrix(std::size_t rows,std::size_t cols,std::mt19937_64& rng,int span){
-    std::vector<F<B>> A(rows*cols);for(auto& x:A){x=reference::random_number<B>(rng,span);if(rng()%13==0)x=zero<B/32>();}return A;}
-template<int B> void check(Linalg& gpu,Linalg& host,const std::vector<F<B>>& A,std::size_t n,std::size_t nb,const std::string& what,std::mt19937_64& rng){
-    FactorOptions o;o.block=nb;o.host_macs=0;o.solve_host_macs=0;FactorOptions h=o;h.gpu=false;
-    const std::size_t blk=nb?std::min(nb,std::max<std::size_t>(n,1)):std::max<std::size_t>(n,1);
-    auto ref=reference_lu<B>(A,n,blk);auto f=gpu.factor_lu(B,A.data(),n,o),g=host.factor_lu(B,A.data(),n,h);
-    const F<B>* W=static_cast<const F<B>*>(f.lu());const F<B>* V=static_cast<const F<B>*>(g.lu());
-    for(std::size_t p=0;p<n*n;++p){require(reference::equal<B>(W[p],ref.W[p]),what+": factor entry "+std::to_string(p)+" != MPFR replay");require(same(W[p],V[p]),what+": GPU and host factors differ");}
+template<class R> std::vector<typename R::T> random_matrix(std::size_t rows,std::size_t cols,std::mt19937_64& rng,int span){
+    std::vector<typename R::T> A(rows*cols);for(auto& x:A){x=R::rnd(rng,span);if(rng()%13==0)x=R::zeros();}return A;}
+template<int B,class R> LUFactor factor(Linalg& la,const std::vector<typename R::T>& A,std::size_t n,const EliminationOptions& o){
+    return R::complex?la.factor_lu_complex(B,A.data(),n,o):la.factor_lu(B,A.data(),n,o);}
+template<int B,class R> void check(Linalg& la,const std::vector<typename R::T>& A,std::size_t n,std::size_t nb,const std::vector<std::size_t>& bounds,std::size_t stop,
+                                   const std::string& what,std::mt19937_64& rng){
+    using T=typename R::T;EliminationOptions o;o.block=nb;o.host_macs=0;o.solve_host_macs=0;o.bounds=bounds;o.stop_at=stop;EliminationOptions h=o;h.gpu=false;
+    const std::size_t blk=nb?std::min(nb,std::max<std::size_t>(n,1)):std::max<std::size_t>(n,1),ke=stop?stop:n;
+    auto ref=reference_lu<R>(A,n,blk,bounds,ke);auto f=factor<B,R>(la,A,n,o),g=factor<B,R>(la,A,n,h);
+    const T* W=static_cast<const T*>(f.lu());const T* V=static_cast<const T*>(g.lu());
+    for(std::size_t p=0;p<n*n;++p){require(R::equal(W[p],ref.W[p]),what+": factor entry "+std::to_string(p)+" != MPFR replay");require(same(W[p],V[p]),what+": GPU and host factors differ");}
     for(std::size_t i=0;i<n;++i)require(f.permutation()[i]==ref.perm[i],what+": permutation");
-    require(f.permutation_sign()==ref.sign&&f.info().zero_pivot==ref.zero_pivot&&f.info().status_column==ref.status_column,what+": info");
-    if(n>nb&&nb&&ref.status_column==n)require(f.info().gpu_updates>0,what+": no GPU update");
-    const std::size_t nrhs=3;auto Bm=random_matrix<B>(n,nrhs,rng,4);std::vector<F<B>> X(n*nrhs),Y(n*nrhs);f.solve(Bm.data(),nrhs,X.data());g.solve(Bm.data(),nrhs,Y.data());
-    if(ref.status_column==n){auto want=reference_solve<B>(ref,Bm,n,nrhs,blk);
-        for(std::size_t p=0;p<X.size();++p){require(reference::equal<B>(X[p],want[p]),what+": solve entry "+std::to_string(p)+" != MPFR replay");require(same(X[p],Y[p]),what+": GPU and host solves differ");}}
-    else for(auto& x:X)require(x.status==invalid&&!x.sign,what+": solve of a status factor");
-    F<B> det;f.determinant(&det);F<B> want=zero<B/32>(invalid);
-    if(ref.status_column==n){if(!n){want=zero<B/32>();want.limb[B/32-1]=0x80000000u;want.sign=1;}else{want=ref.W[0];for(std::size_t i=1;i<n;++i)want=rmul<B>(want,ref.W[i*n+i]);if(ref.sign<0)want=negate(want);}}
-    require(reference::equal<B>(det,want),what+": determinant");
+    require(f.permutation_sign()==ref.sign&&f.info().zero_pivot==ref.zero_pivot&&f.info().status_column==ref.status_column&&f.eliminated()==ke,what+": info");
+    if(ke>nb&&nb&&ref.status_column==n)require(f.info().gpu_updates>0,what+": no GPU update");
+    T det;f.determinant(&det);require(R::equal(det,ref.det),what+": determinant");
+    std::vector<T> lead(bounds.size());f.leading_determinants(lead.data());for(std::size_t b=0;b<bounds.size();++b)require(R::equal(lead[b],ref.lead[b]),what+": leading determinant "+std::to_string(b));
+    if(ke<n){std::vector<T> S((n-ke)*(n-ke));f.schur(S.data());for(std::size_t i=ke;i<n;++i)for(std::size_t j=ke;j<n;++j)require(same(S[(i-ke)*(n-ke)+j-ke],W[i*n+j]),what+": schur copy");}
+    else{const std::size_t nrhs=3;auto Bm=random_matrix<R>(n,nrhs,rng,4);std::vector<T> X(n*nrhs),Y(n*nrhs);f.solve(Bm.data(),nrhs,X.data());g.solve(Bm.data(),nrhs,Y.data());
+        if(ref.status_column==n){auto want=reference_solve<R>(ref,Bm,n,nrhs,blk);
+            for(std::size_t p=0;p<X.size();++p){require(R::equal(X[p],want[p]),what+": solve entry "+std::to_string(p)+" != MPFR replay");require(same(X[p],Y[p]),what+": GPU and host solves differ");}}
+        else for(auto& x:X)require(R::status(x)==invalid&&R::is_zero(x),what+": solve of a status factor");}
 }
-template<int B> void width(){
-    std::mt19937_64 rng(11+B);Linalg gpu,host;
+// Leading determinants equal separate calls on A[0:b, 0:b] (bounds truncated to b), bit for bit.
+template<int B,class R> void separate(Linalg& la,const std::vector<typename R::T>& A,std::size_t n,std::size_t nb,const std::vector<std::size_t>& bounds,const std::string& what){
+    using T=typename R::T;EliminationOptions o;o.block=nb;o.host_macs=0;o.bounds=bounds;auto f=factor<B,R>(la,A,n,o);std::vector<T> lead(bounds.size());f.leading_determinants(lead.data());
+    for(std::size_t k=0;k<bounds.size();++k){const std::size_t b=bounds[k];std::vector<T> sub(b*b);for(std::size_t i=0;i<b;++i)for(std::size_t j=0;j<b;++j)sub[i*b+j]=A[i*n+j];
+        EliminationOptions s=o;s.bounds.assign(bounds.begin(),bounds.begin()+long(k)+1);T d;factor<B,R>(la,sub,b,s).determinant(&d);
+        require(same(d,lead[k]),what+": leading determinant "+std::to_string(k)+" differs from a separate call");}
+}
+template<int B> bool close(const Float<B>& a,const Float<B>& b){auto d=reference::real<B>(Operation::sub,a,b);return !d.sign||d.exponent<std::max(a.exponent,b.exponent)-(B-40);}
+template<int B,class R> void accuracy(Linalg& la,std::mt19937_64& rng,const std::string& what){
+    using T=typename R::T;const std::size_t n=48,k=20;auto A=random_matrix<R>(n,n,rng,0);   // near the identity: I + entries of about 2^-6
+    auto small=[](Float<B>& x){if(x.sign)x.exponent-=6;};
+    for(auto& x:A){if constexpr(R::complex){small(x.re);small(x.im);}else small(x);}
+    for(std::size_t i=0;i<n;++i){Float<B>& d=[&]()->Float<B>&{if constexpr(R::complex)return A[i*n+i].re;else return A[i*n+i];}();d=reference::real<B>(Operation::add,d,RR<B>::one());}
+    EliminationOptions o;o.block=8;T det,lead,sdet;factor<B,R>(la,A,n,o).determinant(&det);
+    EliminationOptions s=o;s.stop_at=k;auto f=factor<B,R>(la,A,n,s);f.determinant(&lead);std::vector<T> S((n-k)*(n-k));f.schur(S.data());factor<B,R>(la,S,n-k,o).determinant(&sdet);
+    const T prod=R::product(lead,sdet);
+    if constexpr(R::complex)require(close<B>(prod.re,det.re)&&close<B>(prod.im,det.im),what+": det(A) != det(leading) det(Schur)");else require(close<B>(prod,det),what+": det(A) != det(leading) det(Schur)");
+    if constexpr(R::complex){
+        // |det A|^2 = det [[Re, -Im], [Im, Re]]; solves agree with complex QR.
+        std::vector<Float<B>> E(4*n*n);for(std::size_t i=0;i<n;++i)for(std::size_t j=0;j<n;++j){const T& a=A[i*n+j];
+            E[i*2*n+j]=a.re;E[i*2*n+n+j]=negate(a.im);E[(n+i)*2*n+j]=a.im;E[(n+i)*2*n+n+j]=a.re;}
+        Float<B> ed;la.factor_lu(B,E.data(),2*n,o).determinant(&ed);const auto m2=reference::real<B>(Operation::add,reference::real<B>(Operation::mul,det.re,det.re),reference::real<B>(Operation::mul,det.im,det.im));
+        require(close<B>(m2,ed),what+": |det|^2 != det of the real embedding");
+        const std::size_t nrhs=4;auto Bm=random_matrix<R>(n,nrhs,rng,0);std::vector<T> X(n*nrhs),Q(n*nrhs);la.factor_lu_complex(B,A.data(),n,o).solve(Bm.data(),nrhs,X.data());
+        la.factor_qr_complex(B,A.data(),n,n).solve(Bm.data(),nrhs,Q.data());
+        for(std::size_t p=0;p<X.size();++p)require(close<B>(X[p].re,Q[p].re)&&close<B>(X[p].im,Q[p].im),what+": LU and QR solutions differ");}
+}
+template<int B,class R> void suite(const char* label){
+    std::mt19937_64 rng(11+B+R::complex);Linalg la;const std::string w=std::string(label)+" bits="+std::to_string(B);
     for(std::size_t n:{0,1,2,5,37,70})for(std::size_t nb:{0,1,8,16,32}){
-        auto A=random_matrix<B>(n,n,rng,n%2?6:300);check<B>(gpu,host,A,n,nb,"bits="+std::to_string(B)+" n="+std::to_string(n)+" nb="+std::to_string(nb),rng);}
-    // Duplicate rows (rounding usually leaves a tiny pivot), a status entry (stops) and a zero column (an exact zero pivot; LAPACK continues).
-    {const std::size_t n=40;auto A=random_matrix<B>(n,n,rng,6);for(std::size_t c=0;c<n;++c)A[17*n+c]=A[3*n+c];check<B>(gpu,host,A,n,16,"equal rows",rng);
-        auto S=random_matrix<B>(n,n,rng,6);S[25*n+30].status=exponent_overflow;check<B>(gpu,host,S,n,16,"status entry",rng);
-        auto Z=random_matrix<B>(n,n,rng,6);for(std::size_t r=0;r<n;++r)Z[r*n+9]=zero<B/32>();check<B>(gpu,host,Z,n,8,"zero column",rng);
-        auto f=gpu.factor_lu(B,Z.data(),n);require(!f.nonsingular()&&f.info().zero_pivot==9,"zero column not reported as zero pivot 9");}
-    std::cout<<B<<" bits: LU factors, permutations, solves and determinants match the MPFR replay; GPU and host updates agree\n";
+        auto A=random_matrix<R>(n,n,rng,n%2?6:300);check<B,R>(la,A,n,nb,{},0,w+" n="+std::to_string(n)+" nb="+std::to_string(nb),rng);}
+    // Segments: leading determinants, bounds 1 apart, b = n; partial elimination at a block end and inside a block.
+    {const std::size_t n=60;auto A=random_matrix<R>(n,n,rng,6);
+        for(std::size_t nb:{0,8,16}){check<B,R>(la,A,n,nb,{5,6,20,33,60},0,w+" bounds nb="+std::to_string(nb),rng);separate<B,R>(la,A,n,nb,{5,6,20,33,60},w+" bounds");
+            check<B,R>(la,A,n,nb,{7,24},24,w+" stop_at 24 nb="+std::to_string(nb),rng);check<B,R>(la,A,n,nb,{},37,w+" stop_at 37 nb="+std::to_string(nb),rng);}}
+    {const std::size_t n=40;auto S=random_matrix<R>(n,n,rng,6);[&]()->word&{if constexpr(R::complex)return S[25*n+30].im.status;else return S[25*n+30].status;}()=exponent_overflow;check<B,R>(la,S,n,16,{10,30},0,w+" status entry",rng);
+        auto Z=random_matrix<R>(n,n,rng,6);for(std::size_t r=0;r<n;++r)Z[r*n+9]=R::zeros();check<B,R>(la,Z,n,8,{},0,w+" zero column",rng);
+        auto Y=random_matrix<R>(n,n,rng,6);for(std::size_t r=0;r<12;++r)Y[r*n+9]=R::zeros();check<B,R>(la,Y,n,8,{12,20,40},0,w+" zero pivot in a segment",rng);
+        auto f=factor<B,R>(la,Z,n,EliminationOptions{});require(!f.nonsingular()&&f.info().zero_pivot==9,w+": zero column not reported as zero pivot 9");}
+    accuracy<B,R>(la,rng,w);
+    std::cout<<w<<": LU factors, permutations, solves, determinants, leading determinants and Schur complements match the MPFR replay\n";
 }
-int main(){try{width<256>();width<1152>();return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{suite<256,RR<256>>("real");suite<1152,RR<1152>>("real");suite<256,RC<256>>("complex");suite<1152,RC<1152>>("complex");return 0;}
+    catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

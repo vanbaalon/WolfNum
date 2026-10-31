@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Add complex LU and complex Pfaffians (`factor_lu_complex`, `pfaffian_complex`). Complex dots round each
+  component once, pivots compare |z|^2 exactly, and the scaled complex division is documented. The
+  complex solve uses GPU block updates for many right-hand sides, and the determinant keeps its phase.
+  Add pivoting segments and partial elimination (`EliminationOptions::bounds`, `stop_at`): leading
+  determinants and Pfaffians at caller bounds from one factorization, and Schur complements
+  `D - C A^-1 B` / `R + Q^T P^-1 Q`. `factor_lu` and `pfaffian` now take `EliminationOptions`
+  (both unreleased). The LU and Pfaffian drivers share one real/complex implementation; real results
+  are unchanged.
+  Validation: the LU and Pfaffian MPFR replays now cover complex, bounds and `stop_at` at 256/1152 bits,
+  bit for bit; leading values equal separate calls; the Schur product identities, |det|^2 against
+  the real embedding and LU against QR solutions agree to 2^-(bits-40).
+
 - Add Pfaffians of real skew-symmetric matrices (`LIMBFORGE_PFAFFIAN_API`): `Linalg::pfaffian`, blocked
   Parlett-Reid with pivoting and GPU skew trailing updates (triangular exact products). The rounding
   sequence depends only on the block size. Validation: `tests/test_pfaffian.cpp` (new) replays it in

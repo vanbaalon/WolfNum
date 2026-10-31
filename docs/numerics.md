@@ -860,7 +860,7 @@ column scaling makes `||A|| ||x||` far larger than the residual scale.
 pivoting, `P A = L U` with unit lower `L`, into an owning `LUFactor`:
 
 ```cpp
-LUFactor f = la.factor_lu(bits, A, n);   // FactorOptions: block, host_macs, solve_host_macs, gpu
+LUFactor f = la.factor_lu(bits, A, n);   // EliminationOptions: block, host_macs, solve_host_macs, gpu, bounds, stop_at
 f.solve(B, nrhs, X);                     // A X = B
 Float<256> det; f.determinant(&det);     // sign(P) * prod u_ii
 f.lu(); f.permutation(); f.permutation_sign(); f.info();
@@ -903,7 +903,7 @@ and host updates must give identical factors and solves.
 n = 1024 takes 0.57 s and n = 2048 takes 2.26 s, of which 0.51 s is GPU time. The host panel and U
 rows take about two thirds of the wall time. They run before each trailing update, without the
 look-ahead overlap Cholesky uses (possible later: it needs deferred row swaps and changes no bits).
-Complex LU is not yet available.
+Complex LU (`factor_lu_complex`) follows the same sequence; see "Complex LU and Pfaffians".
 
 ## Pfaffian
 
@@ -912,7 +912,7 @@ matrix by blocked Parlett–Reid elimination with pivoting:
 
 ```cpp
 Float<256> pf;
-PfaffianInfo info = la.pfaffian(bits, A, n, &pf);   // FactorOptions: block (even), host_macs, gpu
+PfaffianInfo info = la.pfaffian(bits, A, n, &pf);   // EliminationOptions: block (even), host_macs, gpu, bounds, stop_at
 ```
 
 Only the strict lower triangle of A is read (`A_ij = -A_ji` is assumed; the diagonal is zero).
@@ -949,8 +949,87 @@ updates must agree, and `Pf^2` must agree with `det(A)` from `factor_lu` to `2^-
 
 **Measured** (256 bits, block 32, loaded M5 Max host): n = 1024 takes 0.35 s and n = 2048 takes
 1.31 s (0.31 s GPU). The host panel takes about two thirds of the time, as for LU. Complex
-Pfaffians are not yet available; they need the complex host steps, and their trailing updates can
-use `gemm_complex`.
+Pfaffians (`pfaffian_complex`) follow the same sequence; see "Complex LU and Pfaffians".
+
+## Complex LU and Pfaffians
+
+`factor_lu_complex` and `pfaffian_complex` (unreleased) take `Complex<bits/32>` row-major matrices and
+run the real sequences step for step. Only the elementary operations change:
+
+- **Exact dots.** `D(c; x, y; S)` has real part `RN(c.re - sum (re x re y - im x im y))` and imaginary
+  part `RN(c.im - sum (re x im y + im x re y))`, one rounding each, as in `gemm_complex`. The host
+  forms each part as an exact real dot of `2|S|` interleaved terms; the GPU trailing updates are the
+  same exact products, with real columns `2j` and `2j + 1` of complex column `j`.
+- **Pivots.** Pivots compare `|z|^2 = re^2 + im^2` exactly. Leading exponents that differ by two or
+  more decide directly; otherwise both values are scaled by the same power of two and the sign of
+  the exact four-term difference decides. Ties go to the lowest row or index.
+- **Division.** `s / u` takes `u' = u 2^-e`, with `e` the leading exponent of `u`, and
+  `d = RN(|u'|^2)`. Then `re = RN(RN(s.re u'.re + s.im u'.im) / d) 2^-e` and
+  `im = RN(RN(s.im u'.re - s.re u'.im) / d) 2^-e`: each numerator and `d` are one rounding of
+  their exact values, and the power-of-two scalings are exact. The scaling keeps `|u'|^2` near 1, so
+  it neither overflows nor underflows. Statuses propagate; a zero divisor gives `division_by_zero`.
+- **Products.** Determinant and Pfaffian products round each component of each multiplication once
+  (`cfma` with a zero addend), in index order. The determinant keeps its phase.
+- **Solve.** `LUFactor::solve` on a complex factor (`is_complex()`) is blocked as the real `trsm`. In-block
+  steps run on host threads; each block's update of the remaining rows is one exact product on the
+  GPU when it reaches `solve_host_macs`, so many right-hand sides use the GPU.
+- **Storage.** `pfaffian_complex` assumes `A_ij = -A_ji` with no conjugation and reads the strict lower
+  triangle.
+
+**Measured** (192 bits, block 32, loaded M5 Max host, random entries):
+
+| n | factor | solve, n right-hand sides |
+|---|---|---|
+| 1024 | 1.7 s (0.15 s GPU) | 1.0 s |
+| 2048 | 4.7 s (3.5 s host panel) | 6.1 s (2.7 s GPU) |
+
+**Validation.** `tests/test_lu.cpp` and `tests/test_pfaffian.cpp` run every real case for complex
+matrices too, against MPC-style replays in MPFR (`tests/element_reference.hpp`). They also check
+`|det A|^2` against the determinant of the real embedding `[[Re, -Im], [Im, Re]]` and LU solutions
+against `factor_qr_complex`, to `2^-(bits-40)`.
+
+## Pivoting segments and partial elimination
+
+`EliminationOptions` (derived from `FactorOptions`) adds two options to `factor_lu`,
+`factor_lu_complex`, `pfaffian` and `pfaffian_complex`. Without them the factorizations are unchanged.
+
+```cpp
+EliminationOptions o;
+o.bounds = {b1, b2, ...};          // strictly increasing, <= n (even for Pfaffians)
+LUFactor f = la.factor_lu_complex(bits, A, n, o);
+f.leading_determinants(dets);       // det A[0:b, 0:b] for each bound
+la.pfaffian(bits, A, n, &pf, o, leading);   // Pf A[0:b, 0:b] for each bound
+
+o.stop_at = k;                      // eliminate columns [0, k) only
+la.factor_lu(bits, A, n, o).schur(S);       // S = D - C A^-1 B, (n-k) x (n-k)
+la.pfaffian(bits, A, n, &pf_lead, o, nullptr, S); // S = R + Q^T P^-1 Q (full skew storage)
+```
+
+- **Pivot range.** The pivot for column `j` (LU) or step `k` (Pfaffian) is chosen only among rows or
+  indices before the first bound above `j` or `k`. The dots, block partition and trailing products
+  are unchanged. Rows at or beyond a bound therefore never feed rows below it, so each leading value
+  equals, bit for bit, a separate call on `A[0:b, 0:b]` with the bounds truncated to `b`.
+- **Leading values.** Each is the running pivot product (LU) or step product (Pfaffian) at the bound,
+  times the permutation sign so far: exactly the value a separate call returns.
+- **Zero pivots.**
+  - LU continues as `xGETRF`. The leading determinant of the bound containing the zero pivot is
+    zero, and later ones are zero with status `invalid`: entries below the bound were not divided,
+    so restricted pivoting cannot factor those blocks.
+  - The Pfaffian stops. Leading Pfaffians up to the step's segment end are exactly zero; later ones,
+    and the full value when that end is below `n`, are zero with status `invalid`.
+- **Odd n.** `pfaffian` still computes the even leading values; the full Pfaffian is zero.
+- **`stop_at = k`.** Pivots stay within `[0, k)`, and a block ends at `k` (equivalently, the pending
+  terms are applied at `k`). The trailing matrix is then the Schur complement in original row and
+  column order, each entry carrying one rounding per block.
+  - For LU it is `D - C A^-1 B`. `determinant()` is det of the leading `k x k` block, and `solve`
+    throws `logic_error`.
+  - For the Pfaffian of `[P Q; -Q^T R]` it is `R + Q^T P^-1 Q`, written with both triangles, and
+    `out` is `Pf(P)`. `k` must be even.
+
+**Validation.** The replays above cover bounds (including consecutive bounds and `b = n`), `stop_at`
+at and inside a block, odd n, zero pivots inside a segment and status entries. Leading values must
+equal separate calls bit for bit, and `det(A) = det(lead) det(S)` and `Pf(A) = Pf(lead) Pf(S)` must
+hold to `2^-(bits-40)`.
 
 ## Polynomial values and jets
 

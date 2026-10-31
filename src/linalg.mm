@@ -130,7 +130,9 @@ struct PageBlock {
     PageBlock(PageBlock&& o)noexcept:p(o.p),bytes(o.bytes){o.p=nullptr;o.bytes=0;}
     PageBlock& operator=(PageBlock&& o)noexcept{std::swap(p,o.p);std::swap(bytes,o.bytes);return *this;}
 };
-struct LUData {Linalg* owner=nullptr;int bits=0,sign=1;std::size_t n=0,nb=0;LUInfo info;FactorOptions options;PageBlock lu;std::vector<std::size_t> perm;};
+// limits: pivot segment ends (bounds, stop_at) ascending; det and leading hold Float<bits> or Complex values.
+struct LUData {Linalg* owner=nullptr;int bits=0,sign=1;bool complex=false;std::size_t n=0,nb=0,eliminated=0;LUInfo info;FactorOptions options;PageBlock lu;
+    std::vector<std::size_t> perm,bounds,limits;std::vector<unsigned char> det,leading;};
 struct QRData {Linalg* owner=nullptr;int bits=0;std::size_t m=0,n=0,nb=0;QRInfo info;QROptions options;PageBlock v,r,t,tau;std::vector<std::size_t> perm;};
 }
 // Resident products: per ceil(log2 K), the modulus count, Wc and bounds offset for every widest band width pmax in [0, G].
@@ -251,10 +253,12 @@ struct Linalg::Impl {
                                                         void* C,std::size_t ldc,int mode,int tri,bool require_gpu);
     template<int N> CholeskyInfo cholesky_n(const Number<N>* A,std::size_t n,Number<N>* L,const FactorOptions& fo);
     template<int N> Timing solve_n(const Number<N>* L,std::size_t n,const Number<N>* B,std::size_t nrhs,Number<N>* X,const FactorOptions& fo,int passes,bool upper=false,bool unit=false);
-    // Blocked LU with partial pivoting (lu_n) and its solve (lu_solve_n); docs/numerics.md, "LU factorization".
-    template<int N> void lu_n(const Number<N>* A,std::size_t n,detail::LUData& f);
-    template<int N> Timing lu_solve_n(const detail::LUData& f,const Number<N>* B,std::size_t nrhs,Number<N>* X);
-    template<int N> PfaffianInfo pfaffian_n(const Number<N>* A,std::size_t n,Number<N>& out,const FactorOptions& fo);
+    // Blocked LU with partial pivoting and its solve, and Pfaffians (docs/numerics.md, "LU factorization", "Pfaffian"), for an
+    // element policy Fd (RealField / ComplexField below).
+    template<class Fd> void lu_any(const typename Fd::T* A,std::size_t n,detail::LUData& f);
+    template<class Fd> Timing lu_solve_any(const detail::LUData& f,const typename Fd::T* B,std::size_t nrhs,typename Fd::T* X);
+    template<class Fd> PfaffianInfo pfaffian_any(const typename Fd::T* A,std::size_t n,const EliminationOptions& o,typename Fd::T& out,
+                                                 typename Fd::T* leading,typename Fd::T* schur);
     // Householder QR (qr_n), one compact-WY block applied to columns [c0, c1) of X (qr_block), Q or Q^T applied to C (qr_apply_n).
     template<int N> void qr_n(const Number<N>* A,std::size_t m,std::size_t n,detail::QRData& f);
     template<int N> Timing qr_block(const detail::QRData& f,std::size_t b,Number<N>* X,std::size_t ld,std::size_t c0,std::size_t c1,bool qt,Number<N>* Wb,Number<N>* Yb,double threshold,bool gpu,bool& on_gpu,bool have_y=false);
@@ -644,103 +648,192 @@ template<int N> Timing Linalg::Impl::solve_n(const Number<N>* L,std::size_t n,co
     if(W!=X)std::memcpy(static_cast<void*>(X),W,n*nrhs*sizeof(T));
     timing.wall_seconds=since(start);return timing;
 }}
+// ---- Element policies of the LU and Pfaffian drivers ----
+// Products are exact dots over interleaved real data: a row of T is a left operand as stored (Number<N>, or Complex<N> =
+// [re, im] pairs), and right operands are packs of `width` real lines per column, of L words each: real [v_0, v_1, ...];
+// complex [re v_q, -im v_q, ...] and [im v_q, re v_q, ...], whose products with the left row are the real and imaginary parts.
+// dot(c, row, pack, L, col, off, K) = c - sum of K terms from term off of the pack, one rounding per component.
+namespace {
+template<int N> Number<N> shifted(Number<N> x,long e){if(!x.sign)return x;const long r=long(x.exponent)+e;
+    if(r>1000000000L||r< -1000000000L)return zero<N>(x.status|exponent_overflow);x.exponent=int(r);return x;}
+template<int N_> struct RealField {
+    static constexpr int N=N_,width=1;using T=Number<N>;
+    static word status(const T& x){return x.status;}static bool is_zero(const T& x){return !x.sign;}
+    static int compare(const T& a,const T& b){return magnitude_compare(a,b);}
+    static T quotient(const T& a,const T& b){return div(a,b);}static T product(const T& a,const T& b){return mul(a,b);}static T neg(const T& x){return negate(x);}
+    static T zeros(word s=0){return zero<N>(s);}static T one(){T x=zero<N>();x.limb[N-1]=0x80000000u;x.sign=1;return x;}
+    static void put(Number<N>* pack,std::size_t L,std::size_t col,std::size_t q,const T& v){pack[col*L+q]=v;}
+    static T dot(const T& c,const T* row,const Number<N>* pack,std::size_t L,std::size_t col,std::size_t off,std::size_t K){
+        return exact_dot_add<N>(&c,true,row,1,pack+col*L+off,1,K);}
+};
+template<int N_> struct ComplexField {
+    static constexpr int N=N_,width=2;using T=Complex<N>;
+    static word status(const T& x){return x.re.status|x.im.status;}static bool is_zero(const T& x){return !x.re.sign&&!x.im.sign;}
+    static long top(const T& x){long e=LONG_MIN;if(x.re.sign)e=x.re.exponent;if(x.im.sign)e=std::max(e,long(x.im.exponent));return e;}
+    // |a|^2 versus |b|^2, exactly: decided by the leading exponents when they differ by 2 or more (|z| lies in [2^e, 2^(e+1.5))),
+    // otherwise the sign of the exact 4-term dot after scaling both by the same power of two.
+    static int compare(const T& a,const T& b){const long ea=top(a),eb=top(b);
+        if(ea==LONG_MIN||eb==LONG_MIN)return ea==eb?0:ea==LONG_MIN?-1:1;if(ea>=eb+2)return 1;if(eb>=ea+2)return -1;
+        const long e=-std::max(ea,eb);const Number<N> v[4]={shifted(a.re,e),shifted(a.im,e),shifted(b.re,e),shifted(b.im,e)},w[4]={v[0],v[1],negate(v[2]),negate(v[3])};
+        return exact_dot<N>(v,1,w,1,4).sign;}
+    // s / u: u' = u 2^-e (e = u's leading exponent), d = RN(|u'|^2), re = RN(RN(s.re u'.re + s.im u'.im) / d) 2^-e,
+    // im = RN(RN(s.im u'.re - s.re u'.im) / d) 2^-e (each numerator and d one rounding of its exact value).
+    static T quotient(const T& s,const T& u){const word st=status(s)|status(u);if(st)return zeros(st);if(is_zero(u))return zeros(division_by_zero);
+        const long e=top(u);const Number<N> ur=shifted(u.re,-e),ui=shifted(u.im,-e),z=zero<N>(),d=dot2_add(ur,ur,ui,ui,z);
+        return {shifted(div(dot2_add(s.re,ur,s.im,ui,z),d),-e),shifted(div(dot2_add(s.im,ur,negate(s.re),ui,z),d),-e)};}
+    static T product(const T& a,const T& b){const T z{zero<N>(),zero<N>()};return cfma(a,b,z);}   // one rounding per component
+    static T neg(const T& x){return {negate(x.re),negate(x.im)};}
+    static T zeros(word s=0){return {zero<N>(s),zero<N>(s)};}static T one(){return {RealField<N>::one(),zero<N>()};}
+    static void put(Number<N>* pack,std::size_t L,std::size_t col,std::size_t q,const T& v){Number<N>* a=pack+2*col*L+2*q;Number<N>* b=a+L;
+        a[0]=v.re;a[1]=negate(v.im);b[0]=v.im;b[1]=v.re;}
+    static T dot(const T& c,const T* row,const Number<N>* pack,std::size_t L,std::size_t col,std::size_t off,std::size_t K){
+        const Number<N>* l=reinterpret_cast<const Number<N>*>(row);const Number<N>* a=pack+2*col*L+2*off;
+        return {exact_dot_add<N>(&c.re,true,l,1,a,1,2*K),exact_dot_add<N>(&c.im,true,l,1,a+L,1,2*K)};}
+};
+// The first limit (pivot segment end) above j, or n.
+std::size_t segment_end(const std::vector<std::size_t>& limits,std::size_t j,std::size_t n){auto it=std::upper_bound(limits.begin(),limits.end(),j);return it==limits.end()?n:*it;}
+}
 // ---- Blocked LU with partial pivoting (docs/numerics.md, "LU factorization") ----
-// D as for Cholesky. Block [k0, k1): column j of the panel takes u_ij = D(a_ij; l_i, u_j; [k0, i)) for rows i in [k0, j), then the
-// candidates s_ij = D(a_ij; l_i, u_j; [k0, j)) for rows i >= j; the pivot row is the largest |s_ij| (exact comparison, the lowest
-// row on ties), swapped whole; then l_ij = RN(s_ij / u_jj) for i > j (no division for a zero pivot: the column is zero). U rows
-// [k0, k1) right of the block: u_ij = D(a_ij; l_i, u_j; [k0, i)) in row order. Trailing matrix: a_ij = D(a_ij; l_i, u_j; [k0, k1)),
-// on the GPU (run) or the host: identical bits, so only block changes a result.
-template<int N> void Linalg::Impl::lu_n(const Number<N>* A,std::size_t n,detail::LUData& f){@autoreleasepool{
-    using T=Number<N>;auto start=Clock::now();LUInfo& info=f.info;info.zero_pivot=info.status_column=n;const FactorOptions& fo=f.options;const std::size_t nb=f.nb;
+// D(c; l_i, u_j; S) = RN(c - sum_{q in S} l_iq u_qj), one rounding per component. Block [k0, k1) (k1 also ends at stop_at):
+// column j of the panel takes u_ij = D(a_ij; [k0, i)) for rows i in [k0, j), then the candidates s_ij = D(a_ij; [k0, j)) for rows
+// i >= j; the pivot row is the largest |s_ij| among rows before j's segment end (exact comparison, the lowest row on ties),
+// swapped whole; then l_ij = s_ij / u_jj for i > j (no division for a zero pivot). U rows [k0, k1) right of the block:
+// u_ij = D(a_ij; [k0, i)) in row order. Trailing matrix: a_ij = D(a_ij; [k0, k1)), on the GPU (run) or the host: identical bits.
+// U entries of the block are also written to a pack (right operands), so both the host dots and the GPU read rows of W as is.
+template<class Fd> void Linalg::Impl::lu_any(const typename Fd::T* A,std::size_t n,detail::LUData& f){@autoreleasepool{
+    using T=typename Fd::T;constexpr int N=Fd::N,w=Fd::width;auto start=Clock::now();LUInfo& info=f.info;info.zero_pivot=info.status_column=n;
+    const FactorOptions& fo=f.options;const std::size_t nb=f.nb,ke=f.eliminated,L=w*nb;
     T* W=static_cast<T*>(f.lu.p);Residency keep(*this);pool_workers();
     each(n,[&](std::size_t i){std::memcpy(static_cast<void*>(W+i*n),A+i*n,n*sizeof(T));});
     f.perm.resize(n);for(std::size_t i=0;i<n;++i)f.perm[i]=i;f.sign=1;
-    const bool gpu=fo.gpu&&n>nb&&double(n-nb)*double(n-nb)*double(nb)>=fo.host_macs;
-    if(gpu){id<MTLBuffer> b=wrap(W,n*n*sizeof(T));if(!b)throw std::runtime_error("Metal buffer wrap failed (lu)");resident.push_back(b);}
-    auto D=[](const T& c,const T* x,std::ptrdiff_t sx,const T* y,std::ptrdiff_t sy,std::size_t K){return exact_dot_add<N>(&c,true,x,sx,y,sy,K);};
+    const bool gpu=fo.gpu&&ke>nb&&double(n-nb)*double(n-nb)*double(nb)*w*w>=fo.host_macs;
+    id<MTLBuffer> ub=buffer("lu_pack",std::max<std::size_t>(1,w*n*L)*sizeof(Number<N>));Number<N>* U=static_cast<Number<N>*>(ub.contents);
+    if(gpu){id<MTLBuffer> b=wrap(W,n*n*sizeof(T));if(!b)throw std::runtime_error("Metal buffer wrap failed (lu)");resident.push_back(b);resident.push_back(ub);}
+    // Running pivot product (determinant) and the leading determinants at the bounds.
+    std::vector<T> lead(f.bounds.size(),Fd::zeros(invalid));std::size_t bi=0,poison=n;T prod=Fd::one();bool first=true;
+    auto record=[&](std::size_t j,const T& pivot){prod=first?pivot:Fd::product(prod,pivot);first=false;
+        for(;bi<f.bounds.size()&&f.bounds[bi]==j+1;++bi)if(j+1<=poison)lead[bi]=f.sign<0?Fd::neg(prod):prod;};
     std::size_t stop=n;
-    for(std::size_t k0=0;k0<n&&stop==n;k0+=nb){const std::size_t k1=std::min(n,k0+nb);auto t=Clock::now();++info.blocks;
+    for(std::size_t k0=0,k1;k0<ke&&stop==n;k0=k1){k1=std::min({n,k0+nb,ke});auto t=Clock::now();++info.blocks;
         for(std::size_t j=k0;j<k1;++j){
-            for(std::size_t i=k0;i<j;++i)W[i*n+j]=D(W[i*n+j],W+i*n+k0,1,W+k0*n+j,std::ptrdiff_t(n),i-k0);
-            each(n-j,[&](std::size_t r){const std::size_t i=j+r;W[i*n+j]=D(W[i*n+j],W+i*n+k0,1,W+k0*n+j,std::ptrdiff_t(n),j-k0);});
-            word st=0;std::size_t p=j;for(std::size_t i=j;i<n;++i){st|=W[i*n+j].status;if(magnitude_compare(W[i*n+j],W[p*n+j])>0)p=i;}
+            for(std::size_t i=k0;i<j;++i){W[i*n+j]=Fd::dot(W[i*n+j],W+i*n+k0,U,L,j,0,i-k0);Fd::put(U,L,j,i-k0,W[i*n+j]);}
+            each(n-j,[&](std::size_t r){const std::size_t i=j+r;W[i*n+j]=Fd::dot(W[i*n+j],W+i*n+k0,U,L,j,0,j-k0);});
+            const std::size_t e=segment_end(f.limits,j,n);word st=0;std::size_t p=j;
+            for(std::size_t i=j;i<e;++i){st|=Fd::status(W[i*n+j]);if(Fd::compare(W[i*n+j],W[p*n+j])>0)p=i;}
             if(st){stop=j;info.status_column=j;info.status=st;break;}
             if(p!=j){std::swap_ranges(W+p*n,W+p*n+n,W+j*n);std::swap(f.perm[p],f.perm[j]);f.sign=-f.sign;}
-            const T pivot=W[j*n+j];
-            if(!pivot.sign){if(info.zero_pivot==n)info.zero_pivot=j;continue;}
-            each(n-j-1,[&](std::size_t r){T& x=W[(j+1+r)*n+j];x=div(x,pivot);});
+            const T pivot=W[j*n+j];record(j,pivot);
+            if(Fd::is_zero(pivot)){if(info.zero_pivot==n)info.zero_pivot=j;poison=std::min(poison,e);continue;}
+            each(n-j-1,[&](std::size_t r){T& x=W[(j+1+r)*n+j];x=Fd::quotient(x,pivot);});
         }
         if(stop<n){info.panel_seconds+=since(t);break;}
-        // U rows of the block, in chunks of 32 columns.
         each((n-k1+31)/32,[&](std::size_t q){const std::size_t c0=k1+32*q,c1=std::min(n,c0+32);
-            for(std::size_t i=k0;i<k1;++i)for(std::size_t c=c0;c<c1;++c)W[i*n+c]=D(W[i*n+c],W+i*n+k0,1,W+k0*n+c,std::ptrdiff_t(n),i-k0);});
+            for(std::size_t i=k0;i<k1;++i)for(std::size_t c=c0;c<c1;++c){W[i*n+c]=Fd::dot(W[i*n+c],W+i*n+k0,U,L,c,0,i-k0);Fd::put(U,L,c,i-k0,W[i*n+c]);}});
         info.panel_seconds+=since(t);
         if(k1==n)break;
-        t=Clock::now();const std::size_t m=n-k1,K=k1-k0;const bool on_gpu=gpu&&double(m)*double(m)*double(K)>=fo.host_macs;
-        if(on_gpu){auto* base=reinterpret_cast<const unsigned char*>(W);
-            Timing tm=run(32*N,View{base+(k1*n+k0)*sizeof(T),sizeof(T),n,1,N},View{base+(k0*n+k1)*sizeof(T),sizeof(T),1,n,N},m,m,K,W+k1*n+k1,false,false,true,n);
+        t=Clock::now();const std::size_t m=n-k1,K=k1-k0;const bool on_gpu=gpu&&double(m)*double(m)*double(K)*w*w>=fo.host_macs;
+        if(on_gpu){auto* base=reinterpret_cast<const unsigned char*>(W);auto* pk=reinterpret_cast<const unsigned char*>(U+w*k1*L);
+            Timing tm=run(32*N,View{base+(k1*n+k0)*sizeof(T),sizeof(Number<N>),w*n,1,N},View{pk,sizeof(Number<N>),L,1,N},m,w*m,w*K,W+k1*n+k1,false,false,true,w*n,false,false,0,w-1);
             info.timing.gpu_seconds+=tm.gpu_seconds;++info.gpu_updates;}
-        else{each(m,[&](std::size_t r){const std::size_t i=k1+r;for(std::size_t c=k1;c<n;++c)W[i*n+c]=D(W[i*n+c],W+i*n+k0,1,W+k0*n+c,std::ptrdiff_t(n),K);});++info.host_updates;}
+        else{each(m,[&](std::size_t r){const std::size_t i=k1+r;for(std::size_t c=k1;c<n;++c)W[i*n+c]=Fd::dot(W[i*n+c],W+i*n+k0,U,L,c,0,K);});++info.host_updates;}
         info.update_seconds+=since(t);
     }
-    if(stop<n)each(n,[&](std::size_t i){for(std::size_t c=stop;c<n;++c)W[i*n+c]=zero<N>(invalid);});
+    if(stop<n)each(n,[&](std::size_t i){for(std::size_t c=stop;c<n;++c)W[i*n+c]=Fd::zeros(invalid);});
+    T det=stop<n||ke>poison?Fd::zeros(invalid):f.sign<0?Fd::neg(prod):prod;if(!ke&&stop==n)det=Fd::one();
+    f.det.resize(sizeof(T));std::memcpy(f.det.data(),&det,sizeof(T));
+    f.leading.resize(lead.size()*sizeof(T));if(!lead.empty())std::memcpy(f.leading.data(),lead.data(),f.leading.size());
     info.timing.wall_seconds=since(start);
 }}
-template<int N> Timing Linalg::Impl::lu_solve_n(const detail::LUData& f,const Number<N>* B,std::size_t nrhs,Number<N>* X){
-    using T=Number<N>;auto start=Clock::now();const std::size_t n=f.n;Timing timing{0,0};if(!n||!nrhs)return timing;pool_workers();
-    if(f.info.status_column<n){each(n,[&](std::size_t i){for(std::size_t c=0;c<nrhs;++c)X[i*nrhs+c]=zero<N>(invalid);});timing.wall_seconds=since(start);return timing;}
-    each(n,[&](std::size_t i){std::memcpy(static_cast<void*>(X+i*nrhs),B+f.perm[i]*nrhs,nrhs*sizeof(T));});
-    FactorOptions fo=f.options;fo.block=f.nb;const T* F=static_cast<const T*>(f.lu.p);
-    const Timing a=solve_n<N>(F,n,X,nrhs,X,fo,1,false,true),b=solve_n<N>(F,n,X,nrhs,X,fo,2,true);
-    timing.gpu_seconds=a.gpu_seconds+b.gpu_seconds;timing.wall_seconds=since(start);return timing;
-}
+// X = P B, then the unit-lower forward and upper backward substitutions blocked as trsm: in-block D (and, backward, the division
+// by u_ii), then one D per block for the remaining rows (GPU or host). The solved entries of a block are packed as right operands.
+template<class Fd> Timing Linalg::Impl::lu_solve_any(const detail::LUData& f,const typename Fd::T* B,std::size_t nrhs,typename Fd::T* X){@autoreleasepool{
+    using T=typename Fd::T;constexpr int N=Fd::N,w=Fd::width;auto start=Clock::now();const std::size_t n=f.n,nb=f.nb,L=w*nb;Timing timing{0,0};
+    if(!n||!nrhs)return timing;pool_workers();
+    if(f.info.status_column<n){each(n,[&](std::size_t i){for(std::size_t c=0;c<nrhs;++c)X[i*nrhs+c]=Fd::zeros(invalid);});timing.wall_seconds=since(start);return timing;}
+    Residency keep(*this);const T* F=static_cast<const T*>(f.lu.p);T* Y=X;
+    const bool gpu=f.options.gpu&&n>nb&&double(n-nb)*double(nrhs)*double(nb)*w*w>=f.options.solve_host_macs;
+    id<MTLBuffer> pb=buffer("lu_solve_pack",std::max<std::size_t>(1,w*nrhs*L)*sizeof(Number<N>));Number<N>* P=static_cast<Number<N>*>(pb.contents);
+    if(gpu){std::size_t at=0;if(!find(F,at)){id<MTLBuffer> b=wrap(F,n*n*sizeof(T));if(!b)throw std::runtime_error("Metal buffer wrap failed (lu solve)");resident.push_back(b);}
+        if(!find(X,at)){id<MTLBuffer> x=wrap(X,n*nrhs*sizeof(T));if(!x){x=buffer("lu_rhs",n*nrhs*sizeof(T));Y=static_cast<T*>(x.contents);}resident.push_back(x);}
+        resident.push_back(pb);}
+    each(n,[&](std::size_t i){std::memcpy(static_cast<void*>(Y+i*nrhs),B+f.perm[i]*nrhs,nrhs*sizeof(T));});
+    // Rows [r, r+M) of Y take D over factor columns [k0, k0+K) and the packed solution rows of that block.
+    auto update=[&](std::size_t r,std::size_t M,std::size_t k0,std::size_t K){if(!M||!K)return;
+        if(gpu&&double(M)*double(nrhs)*double(K)*w*w>=f.options.solve_host_macs){
+            Timing tm=run(32*N,View{reinterpret_cast<const unsigned char*>(F+r*n+k0),sizeof(Number<N>),w*n,1,N},View{reinterpret_cast<const unsigned char*>(P),sizeof(Number<N>),L,1,N},
+                          M,w*nrhs,w*K,Y+r*nrhs,false,false,true,w*nrhs,false,false,0,w-1);timing.gpu_seconds+=tm.gpu_seconds;}
+        else each(M,[&](std::size_t i){for(std::size_t c=0;c<nrhs;++c){T& y=Y[(r+i)*nrhs+c];y=Fd::dot(y,F+(r+i)*n+k0,P,L,c,0,K);}});};
+    for(std::size_t r0=0;r0<n;r0+=nb){const std::size_t r1=std::min(n,r0+nb);
+        each(nrhs,[&](std::size_t c){for(std::size_t i=r0;i<r1;++i){T& y=Y[i*nrhs+c];y=Fd::dot(y,F+i*n+r0,P,L,c,0,i-r0);Fd::put(P,L,c,i-r0,y);}});
+        update(r1,n-r1,r0,r1-r0);}
+    for(std::size_t r0=(n-1)/nb*nb;;r0-=nb){const std::size_t r1=std::min(n,r0+nb);
+        each(nrhs,[&](std::size_t c){for(std::size_t i=r1;i-->r0;){T& y=Y[i*nrhs+c];if(i+1<r1)y=Fd::dot(y,F+i*n+i+1,P,L,c,i+1-r0,r1-i-1);
+            y=Fd::quotient(y,F[i*n+i]);Fd::put(P,L,c,i-r0,y);}});
+        update(0,r0,r0,r1-r0);if(!r0)break;}
+    if(Y!=X)std::memcpy(static_cast<void*>(X),Y,n*nrhs*sizeof(T));
+    timing.wall_seconds=since(start);return timing;
+}}
 // ---- Pfaffian: blocked Parlett-Reid (docs/numerics.md, "Pfaffian") ----
 // Lower storage W (i > j). Step k (even) eliminates columns k, k+1: a = A[k][k+1] = -W[k+1][k], x_i = W[i][k], y_i = W[i][k+1]
-// (i >= k+2), tau_i = RN(x_i / a), and the Schur complement is S_ic = A_ic - (tau_i y_c - y_i tau_c) = A_ic - P_i . Q_c with
-// P_i = [tau_i, y_i, ...] and Q_c = [y_c, -tau_c, ...] (two terms per step of the block). Entries of the block's later columns take
-// the block's pending terms lazily (one rounding: D over the steps so far); at the end of the block the trailing lower triangle
-// takes them as one exact product (GPU) or exact dots (host), identical bits. Pf(A) = det(P) * prod_k a_k.
-template<int N> PfaffianInfo Linalg::Impl::pfaffian_n(const Number<N>* A,std::size_t n,Number<N>& out,const FactorOptions& fo){@autoreleasepool{
-    using T=Number<N>;auto start=Clock::now();PfaffianInfo info;info.zero_pivot=info.status_column=n;pool_workers();
-    if(n%2){word st=0;for(std::size_t i=0;i<n;++i)for(std::size_t j=0;j<i;++j)st|=A[i*n+j].status;out=zero<N>(st);info.timing.wall_seconds=since(start);return info;}
-    out=zero<N>();out.limb[N-1]=0x80000000u;out.sign=1;if(!n){info.timing.wall_seconds=since(start);return info;}
-    const std::size_t nb=fo.block?std::min(n,(fo.block+1)/2*2):n,h=nb/2;
+// (i >= k+2), tau_i = x_i / a, and the Schur complement is S_ic = A_ic - (tau_i y_c - y_i tau_c) = A_ic - P_i . Q_c with
+// P_i = [tau_i, y_i, ...] (rows of P, left operands as stored) and Q_c = [y_c, -tau_c, ...] (packed right operands), two terms per
+// step. Later columns of a block take its pending terms lazily (one rounding per component); at the end of the block the
+// trailing lower triangle takes them as one exact triangular product (GPU) or exact dots (host), identical bits. Pivots are
+// chosen before the step's segment end. Pf = det(P) * prod_k a_k.
+template<class Fd> PfaffianInfo Linalg::Impl::pfaffian_any(const typename Fd::T* A,std::size_t n,const EliminationOptions& o,typename Fd::T& out,
+                                                           typename Fd::T* leading,typename Fd::T* schur){@autoreleasepool{
+    using T=typename Fd::T;constexpr int N=Fd::N,w=Fd::width;auto start=Clock::now();PfaffianInfo info;info.zero_pivot=info.status_column=n;pool_workers();
+    // Odd n: Pf = 0 (with the lower entries' statuses), but the steps still run to n - 1 for the leading values at the bounds.
+    const bool odd=!o.stop_at&&n%2;const std::size_t ke=o.stop_at?o.stop_at:n-odd;std::vector<std::size_t> limits=o.bounds;if(ke<n)limits.push_back(ke);
+    for(std::size_t b=0;b<o.bounds.size();++b)if(leading)leading[b]=Fd::zeros(invalid);
+    auto finish=[&]{if(odd){word st=0;for(std::size_t i=0;i<n;++i)for(std::size_t j=0;j<i;++j)st|=Fd::status(A[i*n+j]);out=Fd::zeros(st);}
+        info.timing.wall_seconds=since(start);return info;};
+    out=Fd::one();if(odd&&o.bounds.empty())return finish();
+    const std::size_t nb=o.block?std::min(std::max<std::size_t>(ke,2),(o.block+1)/2*2):std::max<std::size_t>(ke+ke%2,2),L=w*nb;
     detail::PageBlock store(n*n*sizeof(T));T* W=static_cast<T*>(store.p);Residency keep(*this);
     each(n,[&](std::size_t i){for(std::size_t j=0;j<i;++j)W[i*n+j]=A[i*n+j];});
-    const bool gpu=fo.gpu&&n>nb&&double(n-nb)*double(n-nb)/2*double(nb)>=fo.host_macs;
-    id<MTLBuffer> pb=buffer("pfaffian_p",n*nb*sizeof(T)),qb=buffer("pfaffian_q",n*nb*sizeof(T));T* P=static_cast<T*>(pb.contents);T* Q=static_cast<T*>(qb.contents);
+    const bool gpu=o.gpu&&n>nb&&double(n-nb)*double(n-nb)/2*double(nb)*w*w>=o.host_macs;
+    id<MTLBuffer> pb=buffer("pfaffian_p",std::max<std::size_t>(1,n*nb)*sizeof(T)),qb=buffer("pfaffian_q",std::max<std::size_t>(1,w*n*L)*sizeof(Number<N>));
+    T* P=static_cast<T*>(pb.contents);Number<N>* Q=static_cast<Number<N>*>(qb.contents);
     if(gpu){id<MTLBuffer> b=wrap(W,n*n*sizeof(T));if(!b)throw std::runtime_error("Metal buffer wrap failed (pfaffian)");resident.push_back(b);resident.push_back(pb);resident.push_back(qb);}
-    auto D=[&](const T& c,std::size_t i,std::size_t j,std::size_t K){return exact_dot_add<N>(&c,true,P+i*nb,1,Q+j*nb,1,K);};
+    auto D=[&](const T& c,std::size_t i,std::size_t j,std::size_t K){return Fd::dot(c,P+i*nb,Q,L,j,0,K);};
     // Symmetric exchange of indices a < b among the active indices >= k (column k is the only finished column still read).
     auto exchange=[&](std::size_t k,std::size_t a,std::size_t b){
         for(std::size_t j=k;j<a;++j)std::swap(W[a*n+j],W[b*n+j]);
-        for(std::size_t i=a+1;i<b;++i){T t=W[i*n+a];W[i*n+a]=negate(W[b*n+i]);W[b*n+i]=negate(t);}
-        W[b*n+a]=negate(W[b*n+a]);
+        for(std::size_t i=a+1;i<b;++i){T t=W[i*n+a];W[i*n+a]=Fd::neg(W[b*n+i]);W[b*n+i]=Fd::neg(t);}
+        W[b*n+a]=Fd::neg(W[b*n+a]);
         for(std::size_t i=b+1;i<n;++i)std::swap(W[i*n+a],W[i*n+b]);
-        std::swap_ranges(P+a*nb,P+a*nb+nb,P+b*nb);std::swap_ranges(Q+a*nb,Q+a*nb+nb,Q+b*nb);};
-    bool first=true;
-    for(std::size_t k0=0;k0<n;k0+=nb){auto t=Clock::now();++info.blocks;std::size_t s=0,k=k0;
-        for(;k<std::min(n,k0+nb);k+=2,++s){
+        std::swap_ranges(P+a*nb,P+a*nb+nb,P+b*nb);std::swap_ranges(Q+w*a*L,Q+w*a*L+w*L,Q+w*b*L);};
+    bool first=true;std::size_t bi=0;
+    auto leads=[&](std::size_t upto,const T& v){ // bounds <= upto get v; after a zero pivot, later ones stay invalid
+        for(;bi<o.bounds.size()&&o.bounds[bi]<=upto;++bi)if(leading)leading[bi]=v;};
+    std::size_t k=0;
+    for(std::size_t k0=0;k0<ke;k0=k){auto t=Clock::now();++info.blocks;std::size_t s=0;const std::size_t k1=std::min({n,k0+nb,ke});
+        for(k=k0;k<k1;k+=2,++s){
             each(n-k-1,[&](std::size_t r){const std::size_t i=k+1+r;W[i*n+k]=D(W[i*n+k],i,k,2*s);});
-            word st=0;std::size_t p=k+1;for(std::size_t i=k+1;i<n;++i){st|=W[i*n+k].status;if(magnitude_compare(W[i*n+k],W[p*n+k])>0)p=i;}
-            if(st){info.status_column=k;info.status=st;out=zero<N>(st);info.panel_seconds+=since(t);info.timing.wall_seconds=since(start);return info;}
-            if(!W[p*n+k].sign){info.zero_pivot=k;out=zero<N>();info.panel_seconds+=since(t);info.timing.wall_seconds=since(start);return info;}
+            const std::size_t e=segment_end(limits,k,n);word st=0;std::size_t p=k+1;
+            for(std::size_t i=k+1;i<e;++i){st|=Fd::status(W[i*n+k]);if(Fd::compare(W[i*n+k],W[p*n+k])>0)p=i;}
+            if(st){info.status_column=k;info.status=st;out=Fd::zeros(st);info.panel_seconds+=since(t);return finish();}
+            if(Fd::is_zero(W[p*n+k])){info.zero_pivot=k;leads(e,Fd::zeros());out=e>=ke?Fd::zeros():Fd::zeros(invalid);info.panel_seconds+=since(t);return finish();}
             if(p!=k+1){exchange(k,k+1,p);info.sign=-info.sign;}
-            const T a=negate(W[(k+1)*n+k]);out=first?a:mul(out,a);first=false;
-            each(n-k-2,[&](std::size_t r){const std::size_t i=k+2+r;T& y=W[i*n+k+1];y=D(y,i,k+1,2*s);
-                const T tau=div(W[i*n+k],a);P[i*nb+2*s]=tau;P[i*nb+2*s+1]=y;Q[i*nb+2*s]=y;Q[i*nb+2*s+1]=negate(tau);});
+            const T a=Fd::neg(W[(k+1)*n+k]);out=first?a:Fd::product(out,a);first=false;
+            leads(k+2,info.sign<0?Fd::neg(out):out);
+            each(n-k-2,[&](std::size_t r){const std::size_t i=k+2+r;T& y=W[i*n+k+1];y=D(y,i,k+1,2*s);const T tau=Fd::quotient(W[i*n+k],a);
+                P[i*nb+2*s]=tau;P[i*nb+2*s+1]=y;Fd::put(Q,L,i,2*s,y);Fd::put(Q,L,i,2*s+1,Fd::neg(tau));});
         }
         info.panel_seconds+=since(t);
         if(k>=n)break;
-        t=Clock::now();const std::size_t m=n-k,K=2*s;const bool on_gpu=gpu&&double(m)*double(m)/2*double(K)>=fo.host_macs;
-        if(on_gpu){auto* pp=reinterpret_cast<const unsigned char*>(P+k*nb);auto* qq=reinterpret_cast<const unsigned char*>(Q+k*nb);
-            Timing tm=run(32*N,View{pp,sizeof(T),nb,1,N},View{qq,sizeof(T),nb,1,N},m,m,K,W+k*n+k,false,false,true,n,false,false,1);
+        t=Clock::now();const std::size_t m=n-k,K=2*s;const bool on_gpu=gpu&&double(m)*double(m)/2*double(K)*w*w>=o.host_macs;
+        if(on_gpu){auto* pp=reinterpret_cast<const unsigned char*>(P+k*nb);auto* qq=reinterpret_cast<const unsigned char*>(Q+w*k*L);
+            Timing tm=run(32*N,View{pp,sizeof(Number<N>),w*nb,1,N},View{qq,sizeof(Number<N>),L,1,N},m,w*m,w*K,W+k*n+k,false,false,true,w*n,false,false,1,w-1);
             info.timing.gpu_seconds+=tm.gpu_seconds;++info.gpu_updates;}
         else{each(m,[&](std::size_t r){const std::size_t i=k+r;for(std::size_t c=k;c<i;++c)W[i*n+c]=D(W[i*n+c],i,c,K);});++info.host_updates;}
         info.update_seconds+=since(t);
     }
-    if(info.sign<0)out=negate(out);
-    info.timing.wall_seconds=since(start);return info;
+    if(info.sign<0)out=Fd::neg(out);
+    if(schur&&ke<n){const std::size_t m=n-ke;each(m,[&](std::size_t i){for(std::size_t j=0;j<m;++j)
+        schur[i*m+j]=i==j?Fd::zeros():i>j?W[(ke+i)*n+ke+j]:Fd::neg(W[(ke+j)*n+ke+i]);});}
+    return finish();
 }}
 // ---- Householder QR (docs/numerics.md, "QR factorization and least squares") ----
 // P(x, y; S) = RN(sum x_k y_k) and D(c; x, y; S) = RN(c - sum x_k y_k), one rounding each (exact_dot / exact_dot_add or
@@ -1050,16 +1143,42 @@ Timing Linalg::cholesky_solve(int bits,const void* L,std::size_t n,const void* B
     return by_words(bits/32,[&](auto w){constexpr int N=decltype(w)::value;
         return impl->solve_n<N>(static_cast<const Number<N>*>(L),n,static_cast<const Number<N>*>(B),nrhs,static_cast<Number<N>*>(X),o,3);});
 }
-PfaffianInfo Linalg::pfaffian(int bits,const void* A,std::size_t n,void* out,const FactorOptions& o){
-    check_bits(bits);check_size(n,1);if(n&&!A)throw std::invalid_argument("null matrix");if(!out)throw std::invalid_argument("null output");
-    return by_words(bits/32,[&](auto w){constexpr int N=decltype(w)::value;Number<N> r;PfaffianInfo info=impl->pfaffian_n<N>(static_cast<const Number<N>*>(A),n,r,o);
+namespace {
+// Validates bounds / stop_at; returns the pivot segment ends (bounds, then stop_at when it is below n).
+std::vector<std::size_t> segment_limits(const EliminationOptions& o,std::size_t n,bool skew,const char* what){
+    const std::size_t ke=o.stop_at?o.stop_at:n;if(ke>n)throw std::invalid_argument(std::string(what)+": stop_at exceeds n");
+    if(skew&&o.stop_at%2)throw std::invalid_argument(std::string(what)+": stop_at must be even");
+    for(std::size_t i=0;i<o.bounds.size();++i){const std::size_t b=o.bounds[i];
+        if(!b||b>ke||(i&&b<=o.bounds[i-1]))throw std::invalid_argument(std::string(what)+": bounds must increase within (0, stop_at or n]");
+        if(skew&&b%2)throw std::invalid_argument(std::string(what)+": Pfaffian bounds must be even");}
+    std::vector<std::size_t> limits=o.bounds;if(ke<n&&(limits.empty()||limits.back()!=ke))limits.push_back(ke);return limits;}
+}
+PfaffianInfo Linalg::pfaffian(int bits,const void* A,std::size_t n,void* out,const EliminationOptions& o,void* leading,void* schur){
+    check_bits(bits);check_size(n,1);if(n&&!A)throw std::invalid_argument("null matrix");if(!out)throw std::invalid_argument("null output");segment_limits(o,n,true,"pfaffian");
+    return by_words(bits/32,[&](auto w){constexpr int N=decltype(w)::value;using Fd=RealField<N>;typename Fd::T r;
+        PfaffianInfo info=impl->pfaffian_any<Fd>(static_cast<const Number<N>*>(A),n,o,r,static_cast<Number<N>*>(leading),static_cast<Number<N>*>(schur));
         std::memcpy(out,&r,sizeof r);return info;});
 }
-LUFactor Linalg::factor_lu(int bits,const void* A,std::size_t n,const FactorOptions& o){
+PfaffianInfo Linalg::pfaffian_complex(int bits,const void* A,std::size_t n,void* out,const EliminationOptions& o,void* leading,void* schur){
+    check_bits(bits);check_size(n,1);if(n&&!A)throw std::invalid_argument("null matrix");if(!out)throw std::invalid_argument("null output");segment_limits(o,n,true,"pfaffian_complex");
+    return by_words(bits/32,[&](auto w){constexpr int N=decltype(w)::value;using Fd=ComplexField<N>;typename Fd::T r;
+        PfaffianInfo info=impl->pfaffian_any<Fd>(static_cast<const Complex<N>*>(A),n,o,r,static_cast<Complex<N>*>(leading),static_cast<Complex<N>*>(schur));
+        std::memcpy(out,&r,sizeof r);return info;});
+}
+static LUFactor make_lu(Linalg* la,int bits,std::size_t n,const EliminationOptions& o,bool complex,std::unique_ptr<detail::LUData>& d){
+    LUFactor u;d=std::make_unique<detail::LUData>();auto& f=*d;f.owner=la;f.bits=bits;f.n=n;f.complex=complex;f.options=o;
+    f.limits=segment_limits(o,n,false,complex?"factor_lu_complex":"factor_lu");f.bounds=o.bounds;f.eliminated=o.stop_at?o.stop_at:n;
+    f.nb=o.block?std::min(o.block,std::max<std::size_t>(n,1)):std::max<std::size_t>(n,1);f.lu=detail::PageBlock(n*n*std::size_t(bits/8+12)*(complex?2:1));return u;}
+LUFactor Linalg::factor_lu(int bits,const void* A,std::size_t n,const EliminationOptions& o){
     check_bits(bits);check_size(n,1);if(n&&!A)throw std::invalid_argument("null matrix");
-    LUFactor u;u.d=std::make_unique<detail::LUData>();auto& f=*u.d;f.owner=this;f.bits=bits;f.n=n;f.nb=o.block?std::min(o.block,n):n;f.options=o;
-    f.lu=detail::PageBlock(n*n*std::size_t(bits/8+12));
-    by_words(bits/32,[&](auto w){constexpr int N=decltype(w)::value;impl->lu_n<N>(static_cast<const Number<N>*>(A),n,f);});
+    LUFactor u=make_lu(this,bits,n,o,false,u.d);auto& f=*u.d;
+    by_words(bits/32,[&](auto w){constexpr int N=decltype(w)::value;impl->lu_any<RealField<N>>(static_cast<const Number<N>*>(A),n,f);});
+    return u;
+}
+LUFactor Linalg::factor_lu_complex(int bits,const void* A,std::size_t n,const EliminationOptions& o){
+    check_bits(bits);check_size(n,1);if(n&&!A)throw std::invalid_argument("null matrix");
+    LUFactor u=make_lu(this,bits,n,o,true,u.d);auto& f=*u.d;
+    by_words(bits/32,[&](auto w){constexpr int N=decltype(w)::value;impl->lu_any<ComplexField<N>>(static_cast<const Complex<N>*>(A),n,f);});
     return u;
 }
 LUFactor::LUFactor()=default;LUFactor::~LUFactor()=default;LUFactor::LUFactor(LUFactor&&)noexcept=default;LUFactor& LUFactor::operator=(LUFactor&&)noexcept=default;
@@ -1073,14 +1192,19 @@ bool LUFactor::nonsingular()const{const auto& f=lu_data(d);return f.info.zero_pi
 const void* LUFactor::lu()const{return lu_data(d).lu.p;}
 const std::size_t* LUFactor::permutation()const{return lu_data(d).perm.data();}
 int LUFactor::permutation_sign()const{return lu_data(d).sign;}
+bool LUFactor::is_complex()const{return lu_data(d).complex;}
+std::size_t LUFactor::eliminated()const{return lu_data(d).eliminated;}
+const std::vector<std::size_t>& LUFactor::bounds()const{return lu_data(d).bounds;}
 Timing LUFactor::solve(const void* B,std::size_t nrhs,void* X)const{const auto& f=lu_data(d);check_size(f.n,nrhs);if(f.n&&nrhs&&(!B||!X))throw std::invalid_argument("null matrix");
-    return by_words(f.bits/32,[&](auto w){constexpr int N=decltype(w)::value;return f.owner->impl->lu_solve_n<N>(f,static_cast<const Number<N>*>(B),nrhs,static_cast<Number<N>*>(X));});}
-void LUFactor::determinant(void* out)const{const auto& f=lu_data(d);if(!out)throw std::invalid_argument("null output");
-    by_words(f.bits/32,[&](auto w){constexpr int N=decltype(w)::value;using T=Number<N>;const T* U=static_cast<const T*>(f.lu.p);T r;
-        if(f.info.status_column<f.n)r=zero<N>(invalid);
-        else if(!f.n){r=zero<N>();r.limb[N-1]=0x80000000u;r.sign=1;}
-        else{r=U[0];for(std::size_t i=1;i<f.n;++i)r=mul(r,U[i*f.n+i]);if(f.sign<0)r=negate(r);}
-        std::memcpy(out,&r,sizeof(T));});}
+    if(f.eliminated<f.n)throw std::logic_error("LUFactor::solve: partial elimination (use schur())");
+    return by_words(f.bits/32,[&](auto w){constexpr int N=decltype(w)::value;
+        if(f.complex)return f.owner->impl->lu_solve_any<ComplexField<N>>(f,static_cast<const Complex<N>*>(B),nrhs,static_cast<Complex<N>*>(X));
+        return f.owner->impl->lu_solve_any<RealField<N>>(f,static_cast<const Number<N>*>(B),nrhs,static_cast<Number<N>*>(X));});}
+void LUFactor::determinant(void* out)const{const auto& f=lu_data(d);if(!out)throw std::invalid_argument("null output");std::memcpy(out,f.det.data(),f.det.size());}
+void LUFactor::leading_determinants(void* out)const{const auto& f=lu_data(d);if(!f.leading.empty()){if(!out)throw std::invalid_argument("null output");std::memcpy(out,f.leading.data(),f.leading.size());}}
+void LUFactor::schur(void* out)const{const auto& f=lu_data(d);const std::size_t m=f.n-f.eliminated,e=std::size_t(f.bits/8+12)*(f.complex?2:1);if(!m)return;
+    if(!out)throw std::invalid_argument("null output");auto* o=static_cast<unsigned char*>(out);const auto* w=static_cast<const unsigned char*>(f.lu.p);
+    for(std::size_t i=0;i<m;++i)std::memcpy(o+i*m*e,w+((f.eliminated+i)*f.n+f.eliminated)*e,m*e);}
 QRFactor Linalg::factor_qr(int bits,const void* A,std::size_t m,std::size_t n,const QROptions& o){
     check_bits(bits);if(m<n)throw std::invalid_argument("factor_qr: rows >= columns required");check_size(n,m);if(m*n&&!A)throw std::invalid_argument("null matrix");
     if(o.rank_bits<0)throw std::invalid_argument("factor_qr: rank_bits >= 0");
