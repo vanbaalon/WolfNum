@@ -1,0 +1,19 @@
+{
+    "workbench.colorCustomizations": {
+        "editor.wordHighlightBackground": "#3399ff18",
+        "editor.wordHighlightStrongBackground": "#3399ff28",
+        "editor.wordHighlightBorder": "#3399ff40",
+        "editor.wordHighlightStrongBorder": "#3399ff55",
+        "notebook.editorBackground": "#f4f4f4",
+        "notebook.cellEditorBackground": "#f7f7f7",
+        "notebook.cellBorderColor": "#dfdfdf",
+        "notebook.inactiveFocusedCellBorder": "#dfdfdf",
+        "notebook.collapsedCellBackground": "#f7f7f7",
+        "notebook.focusedCellBackground": "#f4f4f4",
+        "notebook.selectedCellBackground": "#f4f4f4",
+        "notebook.inactiveSelectedCellBackground": "#f4f4f4",
+        "notebook.cellHoverBackground": "#f4f4f4",
+        "notebook.outputContainerBackgroundColor": "#f7f7f7",
+        "notebook.outputContainerBorderColor": "#dfdfdf"
+    }
+}

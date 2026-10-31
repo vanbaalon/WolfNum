@@ -352,7 +352,7 @@ blocked panels search the whole column, as here).
 | 3 | Modulus size and count after 2 (int8 moduli or two-digit encodings; no padding to 33) | unchanged | open |
 | 4 | Karatsuba complex products (3 real products; exact in residues) | unchanged | open |
 | 5 | Host fixed-point dot kernel for panels (many outputs per call, nfloat style, exact fallback; SME for small exact products) | unchanged | open |
-| 6 | Fused panel passes, look-ahead (deferred swaps) for LU and Pfaffian | unchanged | open |
+| 6 | Fused panel passes (done, 48); look-ahead for LU and Pfaffian: the pivot index's column is being updated in place on the GPU, so it needs an out-of-place trailing update or a pre-update copy of that column | unchanged | fused done; look-ahead open |
 | 7 | Threshold pivoting for two-level blocking | opt-in | open |
 | 8 | Data movement, resident factorization workspaces, latency items (C5, clock ramp) | unchanged | consumer-driven |
 

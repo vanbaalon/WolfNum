@@ -11,6 +11,8 @@
   Cholesky, QR, complex QR, LU and Pfaffian suites pass bit for bit against MPFR. Products written
   in place with every line on the GPU (the factorization updates) skip the per-entry host assembly:
   the update's host overhead in a Pfaffian (n = 4096, block 64) fell from 0.7–0.8 s to 0.1–0.3 s.
+  The LU and Pfaffian panels run one parallel pass per column (step) instead of two, with the same
+  operations: Pfaffian panel 0.89 → 0.63 s (n = 4096, block 64), real LU panel 17–19% shorter.
 
 - Add two-level blocking for Pfaffians (`EliminationOptions::inner_block`, opt-in, rounded up to even;
   previously rejected). Inner blocks are flushed into the panel as exact triangular products. An

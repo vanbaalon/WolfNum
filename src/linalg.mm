@@ -758,16 +758,22 @@ template<class Fd> void Linalg::Impl::lu_any(const typename Fd::T* A,std::size_t
       // later panel columns and its terms flushed into the rest of the panel, all rows (one rounding per inner block). The U rows
       // right of the block follow once its rows are final (a pivot row may come from below the block).
       for(std::size_t i0=k0;i0<k1&&stop==n;i0+=f.ib){const std::size_t i1=std::min(k1,i0+f.ib),off=i0-k0;auto t=Clock::now();
+        // Column c's U entries of rows [i0, c) (row order) and its lazy dots of rows >= c.
+        auto upper=[&](std::size_t c){for(std::size_t i=i0;i<c;++i){W[i*n+c]=Fd::dot(W[i*n+c],W+i*n+i0,U,L,c,off,i-i0);Fd::put(U,L,c,i-k0,W[i*n+c]);}};
+        auto lazy=[&](std::size_t i,std::size_t c){W[i*n+c]=Fd::dot(W[i*n+c],W+i*n+i0,U,L,c,off,c-i0);};
+        bool done=false; // column j's U entries and lazy dots already formed by the previous column's pass
         for(std::size_t j=i0;j<i1;++j){
-            for(std::size_t i=i0;i<j;++i){W[i*n+j]=Fd::dot(W[i*n+j],W+i*n+i0,U,L,j,off,i-i0);Fd::put(U,L,j,i-k0,W[i*n+j]);}
-            each(n-j,[&](std::size_t r){const std::size_t i=j+r;W[i*n+j]=Fd::dot(W[i*n+j],W+i*n+i0,U,L,j,off,j-i0);});
+            if(!done){upper(j);each(n-j,[&](std::size_t r){lazy(j+r,j);});}done=false;
             const std::size_t e=segment_end(f.limits,j,n);word st=0;std::size_t p=j;
             for(std::size_t i=j;i<e;++i){st|=Fd::status(W[i*n+j]);if(Fd::compare(W[i*n+j],W[p*n+j])>0)p=i;}
             if(st){stop=j;info.status_column=j;info.status=st;break;}
             if(p!=j){std::swap_ranges(W+p*n,W+p*n+n,W+j*n);std::swap(f.perm[p],f.perm[j]);f.sign=-f.sign;}
-            const T pivot=W[j*n+j];record(j,pivot);
-            if(Fd::is_zero(pivot)){if(info.zero_pivot==n)info.zero_pivot=j;poison=std::min(poison,e);continue;}
-            each(n-j-1,[&](std::size_t r){T& x=W[(j+1+r)*n+j];x=Fd::quotient(x,pivot);});
+            const T pivot=W[j*n+j];record(j,pivot);const bool zero=Fd::is_zero(pivot);
+            if(zero){if(info.zero_pivot==n)info.zero_pivot=j;poison=std::min(poison,e);}
+            // One pass: per row the division of column j (rows final once j's swap is done) and column j+1's lazy dot; the U
+            // entries of column j+1 need no row below j, so they come first. The same operations as separate passes.
+            if(j+1<i1){upper(j+1);each(n-j-1,[&](std::size_t r){const std::size_t i=j+1+r;if(!zero){T& x=W[i*n+j];x=Fd::quotient(x,pivot);}lazy(i,j+1);});done=true;}
+            else if(!zero)each(n-j-1,[&](std::size_t r){T& x=W[(j+1+r)*n+j];x=Fd::quotient(x,pivot);});
         }
         if(stop<n){info.panel_seconds+=since(t);break;}
         for(std::size_t i=i0;i<i1;++i)for(std::size_t c=i1;c<k1;++c){W[i*n+c]=Fd::dot(W[i*n+c],W+i*n+i0,U,L,c,off,i-i0);Fd::put(U,L,c,i-k0,W[i*n+c]);}
@@ -888,9 +894,10 @@ template<class Fd> PfaffianInfo Linalg::Impl::pfaffian_any(const typename Fd::T*
     std::size_t k=0;
     for(std::size_t k0=0;k0<ke;k0=k){auto t=Clock::now();++info.blocks;std::size_t s=0,s0=0;const std::size_t k1=std::min({n,k0+nb,ke});const bool two=k1-k0>ib;
         if(two)each(n-k0-1,[&](std::size_t r){const std::size_t i=k0+1+r;for(std::size_t c=k0;c<std::min(i,k1);++c)O[i*nb+c-k0]=W[i*n+c];});
+        bool lazy=false; // column k's lazy dots already done by the previous step's pass
         for(k=k0;k<k1;k+=2,++s){
             if(k>k0&&(k-k0)%ib==0){info.panel_seconds+=since(t);flush(k,k1,2*s0,2*(s-s0));s0=s;t=Clock::now();}
-            each(n-k-1,[&](std::size_t r){const std::size_t i=k+1+r;W[i*n+k]=D(W[i*n+k],i,k,2*s0,2*(s-s0));});
+            if(!lazy)each(n-k-1,[&](std::size_t r){const std::size_t i=k+1+r;W[i*n+k]=D(W[i*n+k],i,k,2*s0,2*(s-s0));});lazy=false;
             const std::size_t e=segment_end(limits,k,n);word st=0;std::size_t p=k+1;
             for(std::size_t i=k+1;i<e;++i){st|=Fd::status(W[i*n+k]);if(Fd::compare(W[i*n+k],W[p*n+k])>0)p=i;}
             if(st){info.status_column=k;info.status=st;out=Fd::zeros(st);info.panel_seconds+=since(t);return finish();}
@@ -898,8 +905,13 @@ template<class Fd> PfaffianInfo Linalg::Impl::pfaffian_any(const typename Fd::T*
             if(p!=k+1){exchange(k,k+1,p,two,k0,k1,2*s0);info.sign=-info.sign;}
             const T a=Fd::neg(W[(k+1)*n+k]);out=first?a:Fd::product(out,a);first=false;
             leads(k+2,info.sign<0?Fd::neg(out):out);
-            each(n-k-2,[&](std::size_t r){const std::size_t i=k+2+r;T& y=W[i*n+k+1];y=D(y,i,k+1,2*s0,2*(s-s0));const T tau=Fd::quotient(W[i*n+k],a);
-                P[i*nb+2*s]=tau;P[i*nb+2*s+1]=y;Fd::put(Q,L,i,2*s,y);Fd::put(Q,L,i,2*s+1,Fd::neg(tau));});
+            auto terms=[&](std::size_t i){T& y=W[i*n+k+1];y=D(y,i,k+1,2*s0,2*(s-s0));const T tau=Fd::quotient(W[i*n+k],a);
+                P[i*nb+2*s]=tau;P[i*nb+2*s+1]=y;Fd::put(Q,L,i,2*s,y);Fd::put(Q,L,i,2*s+1,Fd::neg(tau));};
+            // One pass per step: row k+2's terms first (Q of column k+2), then per row this step's terms and the next step's lazy
+            // dot of column k+2 (the same operations; separate passes when the next step starts with an inner flush).
+            if(k+2<k1&&(k+2-k0)%ib){terms(k+2);
+                each(n-k-3,[&](std::size_t r){const std::size_t i=k+3+r;terms(i);W[i*n+k+2]=D(W[i*n+k+2],i,k+2,2*s0,2*(s+1-s0));});lazy=true;}
+            else each(n-k-2,[&](std::size_t r){terms(k+2+r);});
         }
         info.panel_seconds+=since(t);
         if(k>=n)break;
