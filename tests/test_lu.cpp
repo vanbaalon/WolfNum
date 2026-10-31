@@ -106,6 +106,23 @@ template<int B,class R> void accuracy(Linalg& la,std::mt19937_64& rng,const std:
         la.factor_qr_complex(B,A.data(),n,n).solve(Bm.data(),nrhs,Q.data());
         for(std::size_t p=0;p<X.size();++p)require(close<B>(X[p].re,Q[p].re)&&close<B>(X[p].im,Q[p].im),what+": LU and QR solutions differ");}
 }
+// Mixed-precision refinement: a factor at Lo bits refines solutions at B bits to B-bit accuracy (agreement with a B-bit LU solve),
+// with shrinking residuals; the low-width types differ, so the arrays are converted through MPFR here.
+template<int B,int Lo,class R,class RL> void refinement(Linalg& la,std::mt19937_64& rng,const std::string& what){
+    using T=typename R::T;using TL=typename RL::T;const std::size_t n=40,nrhs=5;auto A=random_matrix<R>(n,n,rng,0),Bm=random_matrix<R>(n,nrhs,rng,0);
+    auto small=[](Float<B>& x){if(x.sign)x.exponent-=6;};
+    for(auto& x:A){if constexpr(R::complex){small(x.re);small(x.im);}else small(x);}
+    for(std::size_t i=0;i<n;++i){Float<B>& d=[&]()->Float<B>&{if constexpr(R::complex)return A[i*n+i].re;else return A[i*n+i];}();d=reference::real<B>(Operation::add,d,RR<B>::one());}
+    auto narrow=[](const Float<B>& x){reference::MP m(B);to_mpfr<B>(m.x,x);reference::MP r(Lo);mpfr_set(r.x,m.x,MPFR_RNDN);return from_mpfr<Lo>(r.x);};
+    std::vector<TL> Al(n*n);for(std::size_t i=0;i<n*n;++i){if constexpr(R::complex)Al[i]={narrow(A[i].re),narrow(A[i].im)};else Al[i]=narrow(A[i]);}
+    EliminationOptions o;o.block=8;o.host_macs=0;o.solve_host_macs=0;
+    auto low=R::complex?la.factor_lu_complex(Lo,Al.data(),n,o):la.factor_lu(Lo,Al.data(),n,o);auto full=factor<B,R>(la,A,n,o);
+    std::vector<T> X(n*nrhs),Y(n*nrhs);full.solve(Bm.data(),nrhs,Y.data());auto info=low.solve_refined(B,A.data(),Bm.data(),nrhs,X.data(),5);
+    require(info.residual_exponent.size()==5,what+": refinement steps");
+    for(std::size_t s=1;s<info.residual_exponent.size();++s)require(info.residual_exponent[s]==LONG_MIN||info.residual_exponent[s]<info.residual_exponent[s-1]||info.residual_exponent[s]<-(B-20),what+": residual did not shrink");
+    for(std::size_t p=0;p<X.size();++p){if constexpr(R::complex)require(close<B>(X[p].re,Y[p].re)&&close<B>(X[p].im,Y[p].im),what+": refined solution");else require(close<B>(X[p],Y[p]),what+": refined solution");}
+    bool threw=false;try{full.solve_refined(Lo,Al.data(),Al.data(),nrhs,X.data(),1);}catch(const std::invalid_argument&){threw=true;}require(threw,what+": bits_full below the factor width accepted");
+}
 template<int B,class R> void suite(const char* label){
     std::mt19937_64 rng(11+B+R::complex);Linalg la;const std::string w=std::string(label)+" bits="+std::to_string(B);
     for(std::size_t n:{0,1,2,5,37,70})for(std::size_t nb:{0,1,8,16,32}){
@@ -122,6 +139,8 @@ template<int B,class R> void suite(const char* label){
         auto Y=random_matrix<R>(n,n,rng,6);for(std::size_t r=0;r<12;++r)Y[r*n+9]=R::zeros();check<B,R>(la,Y,n,8,{12,20,40},0,w+" zero pivot in a segment",rng);
         auto f=factor<B,R>(la,Z,n,EliminationOptions{});require(!f.nonsingular()&&f.info().zero_pivot==9,w+": zero column not reported as zero pivot 9");}
     accuracy<B,R>(la,rng,w);
+    if constexpr(B==256){if constexpr(R::complex)refinement<B,128,R,RC<128>>(la,rng,w);else refinement<B,128,R,RR<128>>(la,rng,w);}
+    else{if constexpr(R::complex)refinement<B,256,R,RC<256>>(la,rng,w);else refinement<B,256,R,RR<256>>(la,rng,w);}
     std::cout<<w<<": LU factors, permutations, solves, determinants, leading determinants and Schur complements match the MPFR replay\n";
 }
 int main(){try{suite<256,RR<256>>("real");suite<1152,RR<1152>>("real");suite<256,RC<256>>("complex");suite<1152,RC<1152>>("complex");return 0;}

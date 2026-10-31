@@ -1226,6 +1226,40 @@ Timing LUFactor::solve(const void* B,std::size_t nrhs,void* X)const{const auto& 
     return by_words(f.bits/32,[&](auto w){constexpr int N=decltype(w)::value;
         if(f.complex)return f.owner->impl->lu_solve_any<ComplexField<N>>(f,static_cast<const Complex<N>*>(B),nrhs,static_cast<Complex<N>*>(X));
         return f.owner->impl->lu_solve_any<RealField<N>>(f,static_cast<const Number<N>*>(B),nrhs,static_cast<Number<N>*>(X));});}
+namespace {
+// count numbers of `from` words to `to` words: exact widening (zero low limbs) or one rounding to nearest even (pack_words).
+void convert_width(const unsigned char* in,int from,unsigned char* out,int to,std::size_t count,unsigned threads){
+    const std::size_t ei=std::size_t(4*from+12),eo=std::size_t(4*to+12);
+    by_words(to,[&](auto w){constexpr int N=decltype(w)::value;
+        parallel(threads,count,[&](std::size_t a,std::size_t b){for(std::size_t i=a;i<b;++i){const unsigned char* p=in+i*ei;int e,s;word st;
+            std::memcpy(&e,p+4*from,4);std::memcpy(&s,p+4*from+4,4);std::memcpy(&st,p+4*from+8,4);Number<N> r;
+            if(st||!s)r=zero<N>(st);
+            else if(N>=from){r=zero<N>();std::memcpy(r.limb+(N-from),p,4*std::size_t(from));r.exponent=e;r.sign=s;}
+            else r=detail::pack_words<N>(reinterpret_cast<const word*>(p),std::size_t(from),exponent_type(e)-(32*from-1),s,0);
+            std::memcpy(out+i*eo,&r,eo);}});});}
+}
+RefinementInfo LUFactor::solve_refined(int bits_full,const void* A,const void* B,std::size_t nrhs,void* X,unsigned steps)const{
+    const auto& f=lu_data(d);check_bits(bits_full);if(bits_full<f.bits)throw std::invalid_argument("solve_refined: bits_full below the factor width");
+    check_size(f.n,nrhs);if(f.n&&nrhs&&(!A||!B||!X))throw std::invalid_argument("null matrix");
+    if(f.eliminated<f.n)throw std::logic_error("LUFactor::solve_refined: partial elimination");
+    auto start=Clock::now();RefinementInfo info;const std::size_t n=f.n,parts=f.complex?2:1,count=n*nrhs*parts;if(!count)return info;
+    const int hi=bits_full/32,lo=f.bits/32;const std::size_t eh=std::size_t(bits_full/8+12),el=std::size_t(f.bits/8+12);
+    Linalg& la=*f.owner;const unsigned threads=la.impl->threads();la.impl->pool_workers();
+    std::vector<unsigned char> rl(count*el),dl(count*el),R(count*eh),D(count*eh);
+    auto solve_low=[&](const unsigned char* rhs_hi,unsigned char* out_hi){convert_width(rhs_hi,hi,rl.data(),lo,count,threads);
+        const Timing t=solve(rl.data(),nrhs,dl.data());info.timing.gpu_seconds+=t.gpu_seconds;convert_width(dl.data(),lo,out_hi,hi,count,threads);};
+    solve_low(static_cast<const unsigned char*>(B),static_cast<unsigned char*>(X));
+    for(unsigned s=0;s<steps;++s){
+        std::memcpy(R.data(),B,count*eh);GemmSpec g;g.update=GemmUpdate::subtract;
+        const Timing t=f.complex?la.gemm_complex(bits_full,A,X,n,nrhs,n,R.data(),g):la.gemm(bits_full,A,X,n,nrhs,n,R.data(),g);info.timing.gpu_seconds+=t.gpu_seconds;
+        long top=LONG_MIN;for(std::size_t i=0;i<count;++i){int e,sg;std::memcpy(&e,R.data()+i*eh+4*hi,4);std::memcpy(&sg,R.data()+i*eh+4*hi+4,4);if(sg)top=std::max(top,long(e));}
+        info.residual_exponent.push_back(top);
+        solve_low(R.data(),D.data());
+        by_words(hi,[&](auto w){constexpr int N=decltype(w)::value;auto* x=static_cast<Number<N>*>(X);const auto* dd=reinterpret_cast<const Number<N>*>(D.data());
+            parallel(threads,count,[&](std::size_t a,std::size_t b){for(std::size_t i=a;i<b;++i)x[i]=add(x[i],dd[i]);});});
+    }
+    info.timing.wall_seconds=since(start);return info;
+}
 void LUFactor::determinant(void* out)const{const auto& f=lu_data(d);if(!out)throw std::invalid_argument("null output");std::memcpy(out,f.det.data(),f.det.size());}
 void LUFactor::leading_determinants(void* out)const{const auto& f=lu_data(d);if(!f.leading.empty()){if(!out)throw std::invalid_argument("null output");std::memcpy(out,f.leading.data(),f.leading.size());}}
 void LUFactor::schur(void* out)const{const auto& f=lu_data(d);const std::size_t m=f.n-f.eliminated,e=std::size_t(f.bits/8+12)*(f.complex?2:1);if(!m)return;

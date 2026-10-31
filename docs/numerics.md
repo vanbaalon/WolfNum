@@ -943,6 +943,32 @@ rows take about two thirds of the wall time. They run before each trailing updat
 look-ahead overlap Cholesky uses (possible later: it needs deferred row swaps and changes no bits).
 Complex LU (`factor_lu_complex`) follows the same sequence; see "Complex LU and Pfaffians".
 
+### Iterative refinement
+
+`LUFactor::solve_refined(bits_full, A, B, nrhs, X, steps)` (unreleased; `LIMBFORGE_REFINEMENT_API`) refines
+solutions at a width `bits_full >= bits()` with a factor of lower width, real or complex.
+
+- **Start.** `X_0 = widen(solve(RN(B)))`. `RN` narrows to the factor width with one rounding (ties to
+  even); widening is exact.
+- **Each step.** `R = B - A X` by the exact `gemm` / `gemm_complex` at `bits_full` (one rounding per
+  entry), then `X = RN(X + widen(solve(RN(R))))`.
+- **Result.** `RefinementInfo::residual_exponent` holds the largest binary exponent of each residual,
+  for convergence checks.
+
+For matrices near the identity each step gains about the factor width minus the condition exponent.
+For example, from 128 bits the residual exponents fall to -123 and then -191, which is 192-bit
+working precision.
+
+**Measured** (complex, near identity, n = 2048, 1024 right-hand sides, loaded host): a 128-bit factor
+(3.0 s) plus two refinement steps (5.9 s) takes about as long as a direct 192-bit factor and solve
+(5.9 s). With that many right-hand sides, each step's low-width solve and full-width residual
+product cost about as much as the 192-bit solve. Refinement pays off when the factorization
+dominates (few right-hand sides) or when the widths differ greatly.
+
+**Validation.** `tests/test_lu.cpp` refines 256-bit (1152-bit) systems from 128-bit (256-bit) factors,
+real and complex. It requires agreement with a full-width LU solve to `2^-(bits-40)` and shrinking
+residuals.
+
 ## Pfaffian
 
 `Linalg::pfaffian` (unreleased; `LIMBFORGE_PFAFFIAN_API`) computes `Pf(A)` of a real skew-symmetric

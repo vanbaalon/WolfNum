@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add mixed-precision iterative refinement `LUFactor::solve_refined` (`LIMBFORGE_REFINEMENT_API`): a
+  lower-width factor, exact full-width residuals (gemm / gemm_complex) and widened corrections, with
+  per-step residual exponents. Validation: refinement from 128/256-bit factors to 256/1152 bits,
+  real and complex, agrees with full-width solves to 2^-(bits-40). Measured: not faster than a direct
+  192-bit solve with n/2 right-hand sides (see docs).
+
 - Add broadcast reads of operand `a` (`LIMBFORGE_BROADCAST_A_API`: `Engine::run`/`run_ternary` and
   `CommandBatch::run` overloads with `a_index`), so kernel matrices f(x_i, y_j) build on the GPU from
   row and column vectors. Add the batched block-diagonal congruence `N = T M T^T`

@@ -3,6 +3,7 @@
 #define LIMBFORGE_GEMM_SPEC_API 1
 #define LIMBFORGE_LU_API 1
 #define LIMBFORGE_PFAFFIAN_API 1
+#define LIMBFORGE_REFINEMENT_API 1
 #define LIMBFORGE_ELIMINATION_API 1  // EliminationOptions (bounds, stop_at, inner_block), complex LU and Pfaffians
 // Dense real products with one rounding per output (plan D6 via L1c): C[i][j] = RN(sum_k L[i][k]*R[k][j]),
 // or RN(C[i][j] - sum_k ...) as an update, computed exactly by an integer GEMM over residues (Metal TensorOps
@@ -162,6 +163,9 @@ struct PfaffianInfo {
     std::size_t blocks=0,gpu_updates=0,host_updates=0;
     double panel_seconds=0,update_seconds=0;
 };
+// Outcome of LUFactor::solve_refined: residual_exponent[s] = the largest binary exponent among the entries (both parts) of
+// the s-th residual R = B - A X (LONG_MIN when R = 0), one per refinement step.
+struct RefinementInfo { Timing timing{0,0}; std::vector<long> residual_exponent; };
 namespace detail { struct LUData; }
 // Owning LU factor of an n x n matrix. Like QRFactor it copies what it needs, uses the Linalg that made it (which must outlive
 // it) and follows the Linalg threading rule.
@@ -193,6 +197,11 @@ public:
     // (or Complex) to out. A status column gives zero with status invalid. After a partial elimination: det of the leading
     // eliminated() block. solve requires a complete factorization (logic_error otherwise).
     void determinant(void* out) const;
+    // Mixed-precision iterative refinement (docs/numerics.md, "Iterative refinement"): this factor, of any width bits(), solves
+    // A X = B for A (n x n), B and X (n x nrhs) at bits_full >= bits() (Complex arrays for a complex factor). X_0 = widen(solve(
+    // RN(B))); then `steps` times R = B - A X by the exact gemm at bits_full (one rounding per entry), X = RN(X + widen(solve(RN(R)))).
+    // RN narrows to bits() (one rounding, ties to even); widening is exact. X must not overlap A or B.
+    RefinementInfo solve_refined(int bits_full,const void* A,const void* B,std::size_t nrhs,void* X,unsigned steps) const;
 private:
     friend class Linalg; std::unique_ptr<detail::LUData> d;
 };
