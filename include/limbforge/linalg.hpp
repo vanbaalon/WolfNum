@@ -48,6 +48,9 @@ struct LinalgReport {
     bool zero_copy_output=false;                    // C was page aligned and written by the GPU in place
     bool resident_overflow=false;                   // resident: band rows exceeded the workspace; every output with no zero line on the host
     double analysis_seconds=0,upload_seconds=0,gpu_seconds=0,assembly_seconds=0,fallback_seconds=0;
+    // GPU time per stage, only with LIMBFORGE_LINALG_STAGES=1 (each stage then commits separately, so gpu_seconds is their sum):
+    // digit planes of both operands, int8 residue products, reconstruction (CRT, rounding and multi-band finish).
+    double digits_seconds=0,residue_seconds=0,reconstruct_seconds=0;
 };
 // Memory a Linalg retains between calls (Linalg::workspaces / release_workspaces; docs/numerics.md, "Workspace release"), in bytes.
 struct LinalgWorkspaces {

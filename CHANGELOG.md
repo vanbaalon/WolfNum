@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Speed up dense exact products (gemm, syrk, factorization updates; host and resident): reconstruction
+  uses the CRT weighted sum with a fixed-point quotient instead of Garner's quadratic mixed-radix
+  steps. It gives the same exact integer, so results are unchanged. Measured on a loaded M5 Max
+  (best of 3, K = 32): 1.6× (128 bits), 1.8× (192), 2× (512) and 1.17× (1024) lower product GPU
+  time. Add `LIMBFORGE_LINALG_STAGES` (profiling only) and `LinalgReport::digits_seconds`,
+  `residue_seconds`, `reconstruct_seconds`. Validation: dense product, GEMM spec, resident,
+  Cholesky, QR, complex QR, LU and Pfaffian suites pass bit for bit against MPFR.
+
 - Add two-level blocking for Pfaffians (`EliminationOptions::inner_block`, opt-in, rounded up to even;
   previously rejected). Inner blocks are flushed into the panel as exact triangular products. An
   exchange with an index beyond the panel recomputes the entries that cross between panel and

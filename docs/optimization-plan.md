@@ -327,6 +327,38 @@ pending GitHub speed figures); transcendental retry rungs above 35 words (W ≥ 
 (the panel and that update are the critical path, 45-lookahead), pivoted W rows off the host, a reconstruction-bound trailing
 update; G = 4/8 cooperative shapes with ≥ 3 limbs per lane (validation-only failures, 41-L4b).
 
+## Rounds 47+ (2026-10-31): global plan after the dense factorization work
+
+**Where the time goes** (M5 Max, Metal 4). The GPU product's int8 residue products already run on the
+GPU matrix units (`matmul2d`) with the modular reduction in registers (the EmuGEMM fusion). At small K
+the fixed per-output reconstruction dominated: 78% of GPU time at M = N = 2048, K = 32, 192 bits, and
+74% of a Pfaffian's (n = 2048, block 32). After two-level blocking, host panels are 70–75% of LU and
+Pfaffian wall time.
+
+**Literature checked** (2026-10-31): Ozaki scheme II (Ozaki, Uchino, Imamura 2025) and its INT8/FP8
+GPU follow-ups; CRT complex GEMM with Karatsuba (Uchino et al., arXiv 2512.08321: 3 real products);
+EmuGEMM (arXiv 2606.25453: reduction fused into the integer GEMM, already done here); multiple-precision
+LU with Ozaki II (Kouya, arXiv 2609.29554: CRT and reduction O(p^2) dominate, then the panel);
+simultaneous RNS conversion by linear algebra (Doliskani, Giorgi, Lebreton, Schost, TOMS 2018);
+arb_dot and nfloat fixed-point dots and products (Johansson, ARITH 2019, 2024–2025); SME int8 outer
+products on M4 (arXiv 2512.21473); skew LTL^T variants (Satyarth et al., arXiv 2411.09859: pivoted
+blocked panels search the whole column, as here).
+
+| Step | Item | Bits | Status |
+|---|---|---|---|
+| 0 | Stage profile of products (`LIMBFORGE_LINALG_STAGES`) | — | done (48) |
+| 1 | CRT weighted-sum reconstruction | unchanged | done (48): 1.2–2× product GPU time |
+| 2 | Residue-domain reconstruction as an int8 matrix product (residues × CRT-weight digits, Doliskani et al.), also for digit conversion | unchanged | next |
+| 3 | Modulus size and count after 2 (int8 moduli or two-digit encodings; no padding to 33) | unchanged | open |
+| 4 | Karatsuba complex products (3 real products; exact in residues) | unchanged | open |
+| 5 | Host fixed-point dot kernel for panels (many outputs per call, nfloat style, exact fallback; SME for small exact products) | unchanged | open |
+| 6 | Fused panel passes, look-ahead (deferred swaps) for LU and Pfaffian | unchanged | open |
+| 7 | Threshold pivoting for two-level blocking | opt-in | open |
+| 8 | Data movement, resident factorization workspaces, latency items (C5, clock ramp) | unchanged | consumer-driven |
+
+Every step passes the MPFR replays and GPU/host equality before timings are recorded; timings on this
+host vary up to 2× between runs, so compare interleaved runs.
+
 ## 5. Order, tracks and dependencies
 
 | Sprint | T1 kernels (owns `core.hpp`) | T2 runtime (`engine.*`) | T3 consumer prims | T4 linear algebra |

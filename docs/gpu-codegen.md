@@ -75,7 +75,7 @@ issue, and keep the all-precision GPU fused tests as the gate.
 
 ## 7. A third failure: some odd widths of the exact two-term sum (round 23)
 
-The dense-product updates `RN(c - x)` add a wide exact integer `x` (the Garner integer, `LF_TERM_WORDS`,
+The dense-product updates `RN(c - x)` add a wide exact integer `x` (the CRT integer, `LF_TERM_WORDS`,
 or the multi-band accumulator, `LF_ACC_WORDS`) and the old entry `c` with `exact_add<N, W>` of `core.hpp`
 and round once. The CPU result was exact at every width (20,000 MPFR-checked sums per width), but on the
 GPU about 45% of the sums were wrong (typically the top word lost) for some workspace widths `W` and
@@ -271,6 +271,16 @@ Additional valid/status normal-equation and negative-power sweeps pass at all wi
 The exact compiler defect and the necessity of each part of the workaround have not
 been isolated. Do not infer correctness of another kernel from this result.
 
+
+## 14. CRT column sums keep registers only with constant indices (round 48)
+
+The CRT reconstruction adds `y_j * (M/m_j)` into `Wc` 64-bit column sums. With the loop bound `Wc` (a
+runtime value) the sums array was not kept in registers: reconstruction took 5.2 ms at 192 bits
+(M = N = 2048). Looping to the compile-time bound `LF_WC_MAX` (the largest `Wc` of any call) with an
+`if (k < Wc)` guard gives constant indices and 3.7–4.3 ms. At 1024 bits (`LF_WC_MAX` about 70) the
+unrolled form spills anyway and was 4% slower than Garner; there the kernel stores the `y_j` and forms
+one column at a time (`t = sum_j y_j w_jk`), reading only `y` from private memory, which is 14% faster
+than Garner. The switch is at 40 words.
 
 ## Wide algebra kernels (1056–2048 bits)
 

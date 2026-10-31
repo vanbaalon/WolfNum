@@ -477,7 +477,7 @@ sums them with one `mpfr_sum`.
 **Updates.** With `subtract`, each output becomes `C[i][j] = RN(C[i][j] - sum_k L[i][k] * R[k][j])`,
 again one rounding of the exact value (the old entry is one more exact term). A status on the old
 entry joins the OR above; without nonzero products (empty K or a zero line) the entry is unchanged.
-SYRK updates read and write the lower triangle only. On the GPU the reconstructed exact sum (Garner
+SYRK updates read and write the lower triangle only. On the GPU the reconstructed exact sum (CRT
 integer or multi-band accumulator) and the old entry are added by the two-term exact sum of `fma`
 (a term more than one bit below the other's extended window contributes only its sign) and rounded
 once; the `reconstruct` and `finish` pipelines are specialised by a function constant. The host
@@ -507,9 +507,13 @@ memory traffic (int32 planes written and read back, residue written and read by 
 which dominates a QR trailing update `RN(X - V Y)` (K = 32); a small product needs a handful of
 dispatches instead of four per modulus. The residues are the same exact values.
 
-The modulus count makes `prod m > 4 * K * 2^(Pb + Pc)`, where `Pb` and `Pc` are the widest integer
-widths (`bits` plus the widest band). This is strictly more than the `2 * |sum|` that the signed
-Garner reconstruction needs. When both lines of an output have one band, its reconstructed integer
+The modulus count makes `M = prod m > 4 * K * 2^(Pb + Pc)`, where `Pb` and `Pc` are the widest integer
+widths (`bits` plus the widest band), so `|sum| < M/4`. Reconstruction is the CRT weighted sum
+`x = sum_j y_j M/m_j - q M` with `y_j = r_j (M/m_j)^-1 mod m_j` and `q = round(sum_j y_j / m_j)`. Because
+`|x| < M/4`, that sum lies within 1/4 of `q`, and a 32.32 fixed-point estimate (low by less than
+`L 2^-16`) gives `q` exactly. The sum runs in two's complement over `Wc` words. It is the same exact
+integer as mixed-radix (Garner) reconstruction, which earlier versions used, so results are unchanged.
+When both lines of an output have one band, its reconstructed integer
 is rounded directly with `pack`, as in every other operation. Otherwise the band-pair integers of
 that output are added exactly into a two's-complement accumulator, at their offsets from the
 lowest bands (bounded by `max_spread`), and the total is rounded once. SYRK computes only the lower
@@ -585,7 +589,7 @@ dispatch (a dispatch with nothing to do has zero threadgroups):
 2. `plan_side`, one threadgroup per side: chunked SIMD prefix sums give the band member lists in line
    order, the line table (band count, lowest band exponent, accumulator slot) and a summary (members
    per band, multi- and single-band lines, widest band, fallback lines);
-3. `plan_final`, one thread: the extended sizes, the modulus count, `Wc` and the Garner bounds of the
+3. `plan_final`, one thread: the extended sizes, the modulus count, `Wc` and the CRT constants of the
    widest band (from a table that the host precomputes for this `ceil(log2 K)` and every width
    `0..G`: the host path's formula), and the `Params` record and threadgroup counts of every later
    dispatch;

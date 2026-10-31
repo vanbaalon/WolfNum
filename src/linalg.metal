@@ -1,5 +1,5 @@
 // Dense products with one rounding per output (src/linalg.mm, docs/numerics.md "Dense products").
-// Compiled with MSL 4.0 per (LF_BITS, LF_TERM_WORDS, LF_ACC_WORDS, LF_MAX_MODULI, LF_GROUP).
+// Compiled with MSL 4.0 per (LF_BITS, LF_TERM_WORDS, LF_ACC_WORDS, LF_MAX_MODULI, LF_GROUP, LF_WC_MAX).
 using namespace metal;
 using namespace mpp::tensor_ops;
 using namespace limbforge;
@@ -114,13 +114,13 @@ template<int W> inline Number<N> rounded(thread const word (&X)[W],exponent_type
 inline long slot_of(Line li,Line lj,uint j,constant Params& p){
     return li.slot>=0?long(li.slot)*p.out_cols+j:long(p.multi_rows)*p.out_cols+long(-1-li.slot)*p.multi_cols+lj.slot;
 }
-// Garner reconstruction of the exact integer sums of one band pair, the sub-block at (row0, col0) of the extended product
+// CRT reconstruction of the exact integer sums of one band pair, the sub-block at (row0, col0) of the extended product
 // (symmetric range), then either one rounding (single-band row and column) or exact two's-complement accumulation at its
 // offset from the lowest bands. One dispatch never maps two entries to the same output.
 // p.fold (SYRK pair b > c): entry (i, j) with i < j is the (c, b) term of output (j, i); diagonal entries count twice.
 // p.lower: 1 writes outputs i >= j only, 2 (triangular GEMM) outputs i <= j only, with j = column >> p.col_shift (complex
 // products: real columns 2j and 2j+1 belong to complex column j).
-kernel void reconstruct(device const ushort* res [[buffer(0)]],device const uint* moduli [[buffer(11)]],device const uint* inv [[buffer(2)]],
+kernel void reconstruct(device const ushort* res [[buffer(0)]],device const uint* moduli [[buffer(11)]],
                         device const uint* bounds [[buffer(3)]],device const Member* lband [[buffer(4)]],constant Params& p [[buffer(5)]],
                         device const Member* rband [[buffer(6)]],device const Line* lline [[buffer(7)]],device const Line* rline [[buffer(8)]],
                         device Number<N>* out [[buffer(9)]],device uint* acc [[buffer(10)]],device const uint* recips [[buffer(12)]],
@@ -129,14 +129,29 @@ kernel void reconstruct(device const ushort* res [[buffer(0)]],device const uint
     // A folded pair is reconstructed in two dispatches (p.upper = 0: entries i >= j, 1: i < j) so that no two threads of one
     // dispatch accumulate into the same output.
     Member a=lband[p.row0+r],b=rband[p.col0+c];if(p.lower&&(p.fold?(a.line<b.line)!=bool(p.upper):p.lower==2?a.line>(b.line>>p.col_shift):a.line<(b.line>>p.col_shift)))return;
-    ulong MN=ulong(p.Mp)*p.Np,idx=ulong(p.row0+r)*p.Np+p.col0+c;uint L=p.L,Wc=p.Wc;uint v[LF_MAX_MODULI];
-    for(uint j=0;j<L;++j){uint m=moduli[j],cm=recips[j],t=res[ulong(j)*MN+idx];
-        for(uint i=0;i<j;++i){uint u=v[i]>=m?v[i]-m:v[i];t=t>=u?t-u:t+m-u;t=reduce32(t*inv[i*LF_MAX_MODULI+j],m,cm);}v[j]=t;}
-    word X[LF_TERM_WORDS];for(int k=0;k<LF_TERM_WORDS;++k)X[k]=0;X[0]=v[L-1];
-    for(int j=int(L)-2;j>=0;--j){ulong carry=v[j],m=moduli[j];for(uint k=0;k<Wc;++k){ulong q=ulong(X[k])*m+carry;X[k]=uint(q);carry=q>>32;}}
-    device const uint* mid=bounds;device const uint* full=bounds+Wc;
-    int cmp=0;for(int k=int(Wc)-1;k>=0;--k)if(X[k]!=mid[k]){cmp=X[k]>mid[k]?1:-1;break;}
-    int sign=1;if(cmp>0){long borrow=0;for(uint k=0;k<Wc;++k){long d=long(full[k])-long(X[k])-borrow;X[k]=uint(d);borrow=d<0;}sign=-1;}
+    // x = sum_j y_j M/m_j - q M with y_j = r_j (M/m_j)^-1 mod m_j and q = round(S), S = sum_j y_j / m_j: the moduli bound |x| < M/4
+    // (2 spare bits), so S lies within 1/4 of q, and the 32.32 estimate sum_j y_j floor(2^32/m_j) is low by less than L 2^-16.
+    // Two's complement over Wc words (2^(32 Wc) > 4 M), then sign and magnitude: the same exact integer as mixed-radix Garner.
+    ulong MN=ulong(p.Mp)*p.Np,idx=ulong(p.row0+r)*p.Np+p.col0+c;uint L=p.L,Wc=p.Wc;
+    device const uint* full=bounds+Wc;device const uint* weight=bounds+2*Wc;device const uint* winv=weight+L*Wc;
+    // Column sums. Up to 40 words, A stays in registers: the loops run to the compile-time bound LF_WC_MAX >= Wc (constant
+    // indices). Wider sums go column by column over the stored y_j, so that only y is read from (spilled) private memory.
+    word X[LF_TERM_WORDS];for(int k=0;k<LF_TERM_WORDS;++k)X[k]=0;ulong est=0;
+#if LF_WC_MAX<=40
+    ulong A[LF_WC_MAX];for(int k=0;k<LF_WC_MAX;++k)A[k]=0;
+    for(uint j=0;j<L;++j){const uint m=moduli[j],cm=recips[j],y=reduce32(uint(res[ulong(j)*MN+idx])*winv[j],m,cm);est+=ulong(y)*cm;
+        device const uint* w=weight+j*Wc;for(int k=0;k<LF_WC_MAX;++k)if(uint(k)<Wc)A[k]+=ulong(y)*w[k];}
+    const ulong q=(est+0x80000000ul)>>32;
+    {ulong carry=0,qc=0;uint borrow=0;for(int k=0;k<LF_WC_MAX;++k)if(uint(k)<Wc){const ulong t=A[k]+carry;carry=t>>32;const ulong u=q*full[k]+qc;qc=u>>32;
+        const ulong d=ulong(uint(t))-ulong(uint(u))-borrow;X[k]=uint(d);borrow=uint(d>>63);}}
+#else
+    uint y[LF_MAX_MODULI];
+    for(uint j=0;j<L;++j){const uint m=moduli[j],cm=recips[j];y[j]=reduce32(uint(res[ulong(j)*MN+idx])*winv[j],m,cm);est+=ulong(y[j])*cm;}
+    const ulong q=(est+0x80000000ul)>>32;
+    {ulong carry=0,qc=0;uint borrow=0;for(uint k=0;k<Wc;++k){ulong t=carry;for(uint j=0;j<L;++j)t+=ulong(y[j])*weight[j*Wc+k];carry=t>>32;
+        const ulong u=q*full[k]+qc;qc=u>>32;const ulong d=ulong(uint(t))-ulong(uint(u))-borrow;X[k]=uint(d);borrow=uint(d>>63);}}
+#endif
+    int sign=1;if(X[Wc-1]>>31){ulong cy=1;for(uint k=0;k<Wc;++k){const ulong t=ulong(~X[k])+cy;X[k]=uint(t);cy=t>>32;}sign=-1;}
     int row=a.line,col=b.line,times=1;if(p.fold&&row<=col){times=row==col?2:1;row=b.line;col=a.line;}
     Line li=lline[row],lj=rline[col];
     if(li.bands==1&&lj.bands==1){device Number<N>& o=out[ulong(row)*p.out_stride+col];o=rounded(X,exponent_type(a.lo)+b.lo-2*(32*N-1),sign,o,p.add);return;}
@@ -247,7 +262,7 @@ kernel void plan_final(device const uint* ls [[buffer(0)]],device const uint* rs
     for(uint b=0;b<R;++b){loff[b]=Me;Me+=ls[b];roff[b]=Ne;Ne+=rs[b];}
     const bool overflow=Me>c.me_cap||Ne>c.ne_cap,gpu=Me&&Ne&&!overflow;
     const uint pmax=max(ls[R+2],rs[R+2]),L=table[3*pmax],Wc=table[3*pmax+1],boff=table[3*pmax+2];
-    for(uint w=0;w<2*Wc;++w)bnd[w]=all_bounds[boff+w];
+    for(uint w=0;w<(L+2)*Wc+L;++w)bnd[w]=all_bounds[boff+w];
     const uint Mp=(Me+63)/64*64,Np=c.syrk?Mp:(Ne+63)/64*64,slots=gpu?ls[R]*c.Nc+ls[R+1]*rs[R]:0;
     const uint pairs=R*R,arg0=64*(3+c.batches+pairs);
     device uint* h=plan;h[0]=Me;h[1]=Ne;h[2]=L;h[3]=Wc;h[4]=overflow;h[5]=gpu;h[6]=overflow||ls[R+3]+rs[R+3]>0;h[7]=slots;h[8]=Mp;h[9]=Np;
