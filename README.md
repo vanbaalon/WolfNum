@@ -84,7 +84,7 @@ measurements.
   Zero/status outputs may still be assembled on the host; ordinary `gemm` retains its fallback.
 - **Unreleased:** `Linalg::gemm` with a `GemmSpec`: submatrix views (offsets and leading dimensions) on host
   arrays and Buffers, `transpose_b`, overwrite/add/subtract and lower- or upper-only output. Adds a
-  one-rounding symmetric/skew `syr2k` and multithreaded host `negate_block`/`copy_block`/`axpy_block`; see
+  one-rounding symmetric/skew `syr2k`, large complex `gemm_complex`/`syr2k_complex` (with conjugation) and multithreaded host `negate_block`/`copy_block`/`axpy_block`; see
   [strided, signed and triangular products](docs/numerics.md#strided-signed-and-triangular-products).
 - Real and complex Householder QR, optional column pivoting, reusable least-squares factors,
   multiple-right-hand-side solves and Q application (`linalg.hpp`). QR uses host panels

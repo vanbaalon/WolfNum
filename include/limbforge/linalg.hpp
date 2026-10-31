@@ -117,6 +117,7 @@ struct GemmSpec {
     GemmUpdate update=GemmUpdate::overwrite;
     Triangle triangle=Triangle::full;             // m == n: only outputs i >= j (lower) or i <= j (upper) are computed and written (about half the GPU work)
     bool require_gpu=false;                       // host arrays: as gemm_gpu (host fallback throws before C changes); Buffer forms reject it
+    bool conjugate_a=false,conjugate_b=false;     // complex products only: conjugate op(A) / op(B) (with a transpose: A^H, B^H)
 };
 namespace detail { struct QRData; }
 namespace detail { struct LinalgHooks; } class ComplexQRFactor; // complex QR (end of this header, src/linalg_complex.mm)
@@ -181,6 +182,16 @@ public:
     // dimensions and offsets apply; transpose_b must be false). Each entry is the exact 2k-term dot of [A; B]^T [B; +/-A], packed
     // once (O(nk) copies), so status lines follow gemm: entry (i, j) carries the statuses of lines i and j of A and B.
     Timing syr2k(int bits,const void* A,const void* B,std::size_t n,std::size_t k,void* C,bool skew,const GemmSpec& spec={});
+    // Complex products on Complex<bits/32> host arrays (row-major; leading dimensions and offsets in complex elements): C (m x n)
+    // per spec with op = transpose and/or conjugate. Each real and imaginary part is one rounding of its exact 2k-term real dot
+    // (re = sum re*re - im*im, im = sum re*im + im*re), computed as one real product of the packed lines [re, im] (O((m+n)k)
+    // copies, held in scratch); a status in row i of op(A) or column j of op(B) gives both parts zero with that status.
+    Timing gemm_complex(int bits,const void* A,const void* B,std::size_t m,std::size_t n,std::size_t k,void* C,const GemmSpec& spec={});
+    // Complex rank-2k update: S = A^T B + B^T A (symmetric) or A^T B - B^T A (skew) for A and B (k x n), or A B^T +/- B A^T with
+    // transpose_a (A and B n x k); conjugate_a conjugates the left factors (A^H B +/- B^H A: Hermitian / skew-Hermitian). Each part
+    // of each entry is one rounding of its exact 4k-term dot; C takes S per spec.update and spec.triangle (transpose_b,
+    // conjugate_b must be false).
+    Timing syr2k_complex(int bits,const void* A,const void* B,std::size_t n,std::size_t k,void* C,bool skew,const GemmSpec& spec={});
     // Exact elementwise host utilities on row-major Float<bits> blocks (rows x cols; leading dimensions in elements, 0 = packed),
     // multithreaded over the Linalg's workers. negate_block: X = -X in place. copy_block: Y = X, -X, X^T or -X^T (X is rows x cols,
     // or cols x rows with transpose); Y must not overlap X. axpy_block: Y = RN(Y + alpha X) per entry, one rounding (statuses OR).

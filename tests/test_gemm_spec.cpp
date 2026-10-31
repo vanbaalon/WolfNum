@@ -100,9 +100,54 @@ template<int B> void resident(Engine& e,std::mt19937_64& rng){
     rejects<std::invalid_argument>([&]{auto x=e.make_buffer<F<B>>(16);auto y=e.make_buffer<F<B>>(16);auto z=e.make_buffer<F<B>>(16);GemmSpec s;s.require_gpu=true;
         auto batch=e.batch();la.gemm(batch,x,y,2,2,2,z,s);},"resident require_gpu");
 }
+// ---- Complex products: each part of each entry is one rounding of its exact real dot ----
+template<int B> using Z=Complex<B/32>;
+template<int B> std::vector<Z<B>> cmatrix(std::size_t rows,std::size_t cols,std::mt19937_64& rng){
+    auto re=matrix<B>(rows,cols,rng),im=matrix<B>(rows,cols,rng);std::vector<Z<B>> A(rows*cols);
+    for(std::size_t p=0;p<A.size();++p){A[p].re=re[p];A[p].im=im[p];}return A;}
+template<int B> Z<B> conj(Z<B> x){x.im=negate(x.im);return x;}
+// Expected entry for complex terms x_q y_q: re = RN(c.re + s * sum (re x re y - im x im y)), im likewise.
+template<int B> Z<B> cexpected(GemmUpdate u,Z<B> c,const std::vector<Z<B>>& x,const std::vector<Z<B>>& y){
+    std::vector<F<B>> l,rr,ri;for(auto& v:x)l.push_back(v.re);for(auto& v:x)l.push_back(v.im);
+    for(auto& v:y)rr.push_back(v.re);for(auto& v:y)rr.push_back(negate(v.im));for(auto& v:y)ri.push_back(v.im);for(auto& v:y)ri.push_back(v.re);
+    return {expected<B>(u,c.re,l,rr),expected<B>(u,c.im,l,ri)};}
+template<int B> bool zsame(const Z<B>& a,const Z<B>& b){return same(a,b);}
+template<int B> bool zequal(const Z<B>& a,const Z<B>& b){return reference::equal<B>(a.re,b.re)&&reference::equal<B>(a.im,b.im);}
+template<int B> void complex_products(Linalg& la,const char* label,std::mt19937_64& rng){
+    for(bool ta:{false,true})for(bool tb:{false,true})for(bool ca:{false,true})for(GemmUpdate u:{GemmUpdate::overwrite,GemmUpdate::add,GemmUpdate::subtract})
+        for(Triangle t:{Triangle::full,Triangle::lower,Triangle::upper}){
+            const bool big=u==GemmUpdate::add&&t!=Triangle::full&&!tb;const std::size_t m=big?140:t==Triangle::full?7:9,n=big?140:9,k=big?20:11;
+            GemmSpec s;s.transpose_a=ta;s.transpose_b=tb;s.conjugate_a=ca;s.conjugate_b=ta!=tb;s.update=u;s.triangle=t;
+            const std::size_t ar=ta?k:m,ac=ta?m:k,br=tb?n:k,bc=tb?k:n;s.lda=ac+1;s.ldb=bc+2;s.ldc=n+3;s.a_offset=s.lda+1;s.b_offset=2;s.c_offset=s.ldc+1;
+            auto A=cmatrix<B>(ar+1,s.lda,rng),Bm=cmatrix<B>(br+1,s.ldb,rng),C0=cmatrix<B>(m+2,s.ldc,rng),C=C0;
+            la.gemm_complex(B,A.data(),Bm.data(),m,n,k,C.data(),s);
+            require(la.options().force_fallback?!la.report().gpu_outputs:la.report().gpu_outputs&&la.report().fallback_outputs,"complex placement mix not exercised");
+            auto a=[&](std::size_t i,std::size_t q){Z<B> x=A[s.a_offset+(ta?q*s.lda+i:i*s.lda+q)];return ca?conj<B>(x):x;};
+            auto b=[&](std::size_t q,std::size_t j){Z<B> y=Bm[s.b_offset+(tb?j*s.ldb+q:q*s.ldb+j)];return s.conjugate_b?conj<B>(y):y;};
+            std::size_t bad=0;
+            for(std::size_t p=0;p<C.size();++p){const std::size_t rel=p-s.c_offset,i=rel/s.ldc,j=rel%s.ldc;const bool in=p>=s.c_offset&&i<m&&j<n&&written(t,i,j);
+                if(!in){bad+=!zsame<B>(C[p],C0[p]);continue;}
+                std::vector<Z<B>> x(k),y(k);for(std::size_t q=0;q<k;++q){x[q]=a(i,q);y[q]=b(q,j);}bad+=!zequal<B>(C[p],cexpected<B>(u,C0[p],x,y));}
+            require(!bad,std::string(label)+" gemm_complex bits="+std::to_string(B)+" ta="+std::to_string(ta)+" tb="+std::to_string(tb)+" ca="+std::to_string(ca)+
+                    " "+name(u)+" tri="+std::to_string(int(t))+": "+std::to_string(bad)+" mismatches");}
+    rejects<std::invalid_argument>([&]{GemmSpec s;s.conjugate_a=true;std::vector<F<B>> x(4);la.gemm(B,x.data(),x.data(),2,2,1,x.data(),s);},"conjugation in a real gemm");
+    const std::size_t n=8,k=5;
+    for(bool rows:{false,true})for(bool skew:{false,true})for(bool ca:{false,true})for(Triangle t:{Triangle::full,Triangle::lower}){
+        const std::size_t cols=rows?k:n,lines=rows?n:k,ld=cols+1;auto A=cmatrix<B>(lines,ld,rng),Bm=cmatrix<B>(lines+1,ld,rng),C0=cmatrix<B>(n,n,rng),C=C0;
+        GemmSpec s;s.transpose_a=rows;s.conjugate_a=ca;s.lda=s.ldb=ld;s.b_offset=ld;s.update=GemmUpdate::subtract;s.triangle=t;
+        la.syr2k_complex(B,A.data(),Bm.data(),n,k,C.data(),skew,s);
+        auto el=[&](const std::vector<Z<B>>& M,std::size_t off,std::size_t i,std::size_t q){return M[off+(rows?i*ld+q:q*ld+i)];};
+        for(std::size_t i=0;i<n;++i)for(std::size_t j=0;j<n;++j){const std::size_t p=i*n+j;
+            if(!written(t,i,j)){require(zsame<B>(C[p],C0[p]),"syr2k_complex touched an entry outside the triangle");continue;}
+            std::vector<Z<B>> x(2*k),y(2*k);
+            for(std::size_t q=0;q<k;++q){x[q]=el(A,0,i,q);x[k+q]=el(Bm,ld,i,q);if(ca){x[q]=conj<B>(x[q]);x[k+q]=conj<B>(x[k+q]);}
+                y[q]=el(Bm,ld,j,q);y[k+q]=el(A,0,j,q);if(skew){y[k+q].re=negate(y[k+q].re);y[k+q].im=negate(y[k+q].im);}}
+            require(zequal<B>(C[p],cexpected<B>(GemmUpdate::subtract,C0[p],x,y)),std::string(label)+" syr2k_complex bits="+std::to_string(B)+" rows="+std::to_string(rows)+
+                    " skew="+std::to_string(skew)+" ca="+std::to_string(ca)+" entry "+std::to_string(p));}}
+}
 template<int B> void width(Engine& e){
     std::mt19937_64 rng(77+B);Linalg gpu;LinalgOptions forced;forced.force_fallback=true;Linalg host(forced);
-    host_products<B>(gpu,"gpu",rng);host_products<B>(host,"host",rng);syr2k_cases<B>(gpu,rng);syr2k_cases<B>(host,rng);utilities<B>(gpu,rng);resident<B>(e,rng);
-    std::cout<<B<<" bits: strided/transposed/signed/triangular gemm, syr2k and block utilities match MPFR\n";
+    host_products<B>(gpu,"gpu",rng);host_products<B>(host,"host",rng);syr2k_cases<B>(gpu,rng);syr2k_cases<B>(host,rng);complex_products<B>(gpu,"gpu",rng);complex_products<B>(host,"host",rng);utilities<B>(gpu,rng);resident<B>(e,rng);
+    std::cout<<B<<" bits: strided/transposed/signed/triangular real and complex gemm, syr2k and block utilities match MPFR\n";
 }
 int main(){try{Engine e;width<256>(e);width<1152>(e);return 0;}catch(const std::exception& x){std::cerr<<x.what()<<'\n';return 1;}}

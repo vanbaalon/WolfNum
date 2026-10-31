@@ -662,6 +662,26 @@ bit. Existing entry points and defaults are unchanged.
   in one batch is therefore still rejected. Recursion that writes several blocks of one matrix
   needs one batch per dependent write, or the host-array form.
 
+**Complex products.** `gemm_complex` takes `Complex<bits/32>` host arrays with the same `GemmSpec`
+(leading dimensions and offsets in complex elements), plus `conjugate_a` / `conjugate_b` for `A^H` and
+`B^H` (or plain conjugates without a transpose). `syr2k_complex` forms `A^T B ± B^T A`, or with
+`conjugate_a` the Hermitian / skew-Hermitian `A^H B ± B^H A`.
+
+- **Contract.** Each part of each entry is one rounding of its exact real dot:
+  `re = RN(sum re(a) re(b) - im(a) im(b))` and `im = RN(sum re(a) im(b) + im(a) re(b))`, as in the
+  batched complex GEMM. The update modes apply the old part as one more exact term. A status in
+  row i of op(A) or column j of op(B) makes both parts zero with that status.
+- **Method.** The product runs as one real exact GEMM of 4mnk multiply-adds. Left lines are packed as
+  `[re, im]` (2k terms). Right lines `2j` and `2j + 1` are packed as `[re, -im]` and `[im, re]`, so
+  the real output lands directly in C's interleaved layout. The packed operands take O((m + n) k)
+  scratch, about the size of the inputs. The Gauss three-multiplication form is not used: its
+  operand sums are not exact.
+- **Triangles.** Triangles select complex entries; real columns `2j` and `2j + 1` belong to complex
+  column `j`, and off-triangle residue tiles are skipped as for real products.
+- **Not yet supported.** Resident (Buffer) complex products.
+- **Measured.** At 256 bits, n = 1024 and k = 256 on a loaded host, `gemm_complex` took 2.6x the
+  GPU time and 2.35x the wall time of a real `gemm` of the same shape (median of 5).
+
 **Block utilities.** `negate_block`, `copy_block` (optionally transposing and/or negating) and
 `axpy_block` (`Y = RN(Y + alpha X)`, one rounding per entry, as `fma`) work on strided host blocks
 over the Linalg's worker threads. Negation and copies are exact.
@@ -672,7 +692,9 @@ over the Linalg's worker threads. Negation and copies are exact.
 - the GPU, forced-host and resident paths, with placement checked to mix GPU, multi-band and
   fallback outputs;
 - untouched entries, compared bit for bit;
-- `syr2k` (both forms, symmetric and skew) and the utilities.
+- `syr2k` (both forms, symmetric and skew) and the utilities;
+- `gemm_complex` (every transpose/conjugate/update/triangle combination, including multi-tile
+  triangles) and `syr2k_complex` (both forms, symmetric/skew, with and without conjugation).
 
 ### Workspace release
 

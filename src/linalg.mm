@@ -26,7 +26,7 @@ namespace {
 using Clock=std::chrono::steady_clock;
 double since(Clock::time_point t){return std::chrono::duration<double>(Clock::now()-t).count();}
 std::string message(NSError* e){return e?std::string([[e localizedDescription] UTF8String]):"unknown Metal error";}
-struct Params {std::uint32_t rows,cols,K,Kp,Mp,Np,j,L,Wc,tri,lower,fold,ls_line,ls_k,rs_line,rs_k,out_cols,multi_rows,multi_cols,both,j0,group,upper,row0,col0,out_stride,add;};
+struct Params {std::uint32_t rows,cols,K,Kp,Mp,Np,j,L,Wc,tri,lower,fold,ls_line,ls_k,rs_line,rs_k,out_cols,multi_rows,multi_cols,both,j0,group,upper,row0,col0,out_stride,add,col_shift;};
 struct Line {std::int32_t bands,low,slot;};
 struct Member {std::int32_t line,lo,hi;};
 constexpr std::size_t max_k=65472; // concatenated digit product: 2*Kp*2^14 < 2^31
@@ -239,9 +239,15 @@ struct Linalg::Impl {
     Kernels& get(int bits){return cache->get(bits);}
     const std::vector<std::uint32_t>& bounds(Kernels& k,int L,int Wc){return cache->bounds(k,L,Wc);}
     // C[i*stride + j] (stride 0: Nc) = RN(dot), or RN(C - dot) with sub, RN(C + dot) with add. Views and C inside a resident buffer
-    // are used in place; other strided views are packed. tri (GEMM, M == Nc): 1 writes outputs i >= j only, 2 outputs i <= j only.
+    // are used in place; other strided views are packed. tri (GEMM, M == Nc >> col_shift): 1 writes outputs i >= j only, 2 outputs
+    // i <= j only, for j = column >> col_shift (1: complex products, real columns 2j and 2j+1 of complex column j).
     Timing run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,std::size_t K,void* C,bool syrk,bool lower_only,bool sub=false,std::size_t stride=0,bool require_gpu=false,
-               bool add=false,int tri=0);
+               bool add=false,int tri=0,int col_shift=0);
+    // Complex product on the real pipeline: left line i = [re x_i, im x_i] (2K), right lines 2j = [re y_j, -im y_j] and 2j+1 =
+    // [im y_j, re y_j], so real output (i, 2j + c) is component c of complex output (i, j), written interleaved. left(i, q) and
+    // right(j, q) return the Complex element; conj_* conjugates that side. mode: 0 overwrite, 1 subtract, 2 add.
+    template<class Left,class Right> Timing complex_run(int bits,std::size_t M,std::size_t Nc,std::size_t K,Left left,Right right,bool conj_l,bool conj_r,
+                                                        void* C,std::size_t ldc,int mode,int tri,bool require_gpu);
     template<int N> CholeskyInfo cholesky_n(const Number<N>* A,std::size_t n,Number<N>* L,const FactorOptions& fo);
     template<int N> Timing solve_n(const Number<N>* L,std::size_t n,const Number<N>* B,std::size_t nrhs,Number<N>* X,const FactorOptions& fo,int passes,bool upper=false);
     // Householder QR (qr_n), one compact-WY block applied to columns [c0, c1) of X (qr_block), Q or Q^T applied to C (qr_apply_n).
@@ -324,14 +330,14 @@ int triangle_code(Triangle t){return t==Triangle::lower?1:t==Triangle::upper?2:0
 std::size_t view_extent(std::size_t lines,std::size_t K,std::size_t line_stride,std::size_t k_stride){return lines&&K?(lines-1)*line_stride+(K-1)*k_stride+1:0;}
 }
 Timing Linalg::gemm(int bits,const void* A,const void* B,std::size_t m,std::size_t n,std::size_t k,void* C,const GemmSpec& spec){
-    check_bits(bits);const GemmViews v=gemm_views(spec,m,n,k,"gemm");const std::size_t e=bits/8+12;
+    check_bits(bits);if(spec.conjugate_a||spec.conjugate_b)throw std::invalid_argument("gemm: conjugation applies to complex products (gemm_complex)");const GemmViews v=gemm_views(spec,m,n,k,"gemm");const std::size_t e=bits/8+12;
     auto at=[&](const void* p,std::size_t offset){return p?static_cast<const unsigned char*>(p)+offset*e:nullptr;};
     void* c=C?static_cast<unsigned char*>(C)+spec.c_offset*e:nullptr;
     return impl->run(bits,{at(A,spec.a_offset),e,v.ls_line,v.ls_k,bits/32},{at(B,spec.b_offset),e,v.rs_line,v.rs_k,bits/32},m,n,k,c,false,false,
                      spec.update==GemmUpdate::subtract,v.ldc,spec.require_gpu,spec.update==GemmUpdate::add,triangle_code(spec.triangle));
 }
 Timing Linalg::syr2k(int bits,const void* A,const void* B,std::size_t n,std::size_t k,void* C,bool skew,const GemmSpec& spec){
-    check_bits(bits);if(spec.transpose_b)throw std::invalid_argument("syr2k: transpose_b must be false");
+    check_bits(bits);if(spec.transpose_b||spec.conjugate_a||spec.conjugate_b)throw std::invalid_argument("syr2k: transpose_b and conjugation must be false (syr2k_complex conjugates)");
     // Lines are columns of A and B (k x n), or rows (n x k) with transpose_a.
     const bool rows=spec.transpose_a;const std::size_t cols=rows?k:n,lda=spec.lda?spec.lda:cols,ldb=spec.ldb?spec.ldb:cols,ldc=spec.ldc?spec.ldc:n;
     if(lda<cols||ldb<cols||ldc<n)throw std::invalid_argument("syr2k: leading dimension below the stored column count");
@@ -353,6 +359,56 @@ Timing Linalg::syr2k(int bits,const void* A,const void* B,std::size_t n,std::siz
     void* c=C?static_cast<unsigned char*>(C)+spec.c_offset*e:nullptr;
     return impl->run(bits,{l,e,K2,1,N},{r,e,K2,1,N},n,n,K2,c,false,false,spec.update==GemmUpdate::subtract,ldc,spec.require_gpu,
                      spec.update==GemmUpdate::add,triangle_code(spec.triangle));
+}
+template<class Left,class Right> Timing Linalg::Impl::complex_run(int bits,std::size_t M,std::size_t Nc,std::size_t K,Left left,Right right,bool conj_l,bool conj_r,
+                                                                void* C,std::size_t ldc,int mode,int tri,bool require_gpu){
+    const std::size_t limit=std::size_t(1)<<31,K2=2*K;
+    if(K2>=limit||M*K2>=limit||2*Nc*K2>=limit||2*ldc>=limit)throw std::invalid_argument("complex product: dimensions exceed 32-bit indexing");
+    const int N=bits/32;const std::size_t e=bits/8+12,at=bits/8+4;
+    Residency guard(*this);id<MTLBuffer> lb=buffer("complex_left",M*K2*e),rb=buffer("complex_right",2*Nc*K2*e);resident.push_back(lb);resident.push_back(rb);
+    auto* l=static_cast<unsigned char*>(lb.contents);auto* r=static_cast<unsigned char*>(rb.contents);
+    auto flip=[&](unsigned char* p){int s;std::memcpy(&s,p+at,4);s=-s;std::memcpy(p+at,&s,4);};
+    pool_workers();
+    parallel(threads(),K?M:0,[&](std::size_t i0,std::size_t i1){for(std::size_t i=i0;i<i1;++i)for(std::size_t q=0;q<K;++q){
+        const unsigned char* x=left(i,q);unsigned char* d=l+i*K2*e;std::memcpy(d+q*e,x,e);std::memcpy(d+(K+q)*e,x+e,e);if(conj_l)flip(d+(K+q)*e);}});
+    parallel(threads(),K?Nc:0,[&](std::size_t j0,std::size_t j1){for(std::size_t j=j0;j<j1;++j)for(std::size_t q=0;q<K;++q){
+        const unsigned char* y=right(j,q);unsigned char *re=r+2*j*K2*e,*im=re+K2*e; // re(x y) = [re x, im x].[re y, -im y]; im(x y) = [re x, im x].[im y, re y]
+        std::memcpy(re+q*e,y,e);std::memcpy(re+(K+q)*e,y+e,e);std::memcpy(im+q*e,y+e,e);std::memcpy(im+(K+q)*e,y,e);
+        if(!conj_r)flip(re+(K+q)*e);else flip(im+q*e);}});
+    return run(bits,{l,e,K2,1,N},{r,e,K2,1,N},M,2*Nc,K2,C,false,false,mode==1,2*ldc,require_gpu,mode==2,tri,1);
+}
+namespace {
+int update_mode(GemmUpdate u){return u==GemmUpdate::subtract?1:u==GemmUpdate::add?2:0;}
+}
+Timing Linalg::gemm_complex(int bits,const void* A,const void* B,std::size_t m,std::size_t n,std::size_t k,void* C,const GemmSpec& spec){
+    check_bits(bits);const GemmViews v=gemm_views(spec,m,n,k,"gemm_complex");const std::size_t e=2*(bits/8+12);
+    if(m&&n&&!C)throw std::invalid_argument("null output");if(m*n&&k&&(!A||!B))throw std::invalid_argument("null input");
+    const auto* a=static_cast<const unsigned char*>(A);const auto* b=static_cast<const unsigned char*>(B);
+    auto left=[&](std::size_t i,std::size_t q){return a+(spec.a_offset+i*v.ls_line+q*v.ls_k)*e;};
+    auto right=[&](std::size_t j,std::size_t q){return b+(spec.b_offset+j*v.rs_line+q*v.rs_k)*e;};
+    void* c=C?static_cast<unsigned char*>(C)+spec.c_offset*e:nullptr;
+    return impl->complex_run(bits,m,n,k,left,right,spec.conjugate_a,spec.conjugate_b,c,v.ldc,update_mode(spec.update),triangle_code(spec.triangle),spec.require_gpu);
+}
+Timing Linalg::syr2k_complex(int bits,const void* A,const void* B,std::size_t n,std::size_t k,void* C,bool skew,const GemmSpec& spec){
+    check_bits(bits);if(spec.transpose_b||spec.conjugate_b)throw std::invalid_argument("syr2k_complex: transpose_b and conjugate_b must be false");
+    const bool rows=spec.transpose_a;const std::size_t cols=rows?k:n,lda=spec.lda?spec.lda:cols,ldb=spec.ldb?spec.ldb:cols,ldc=spec.ldc?spec.ldc:n;
+    if(lda<cols||ldb<cols||ldc<n)throw std::invalid_argument("syr2k_complex: leading dimension below the stored column count");
+    if(n&&k&&(!A||!B))throw std::invalid_argument("null input");if(n&&!C)throw std::invalid_argument("null output");
+    // Lines of the 2k-term complex dot: left i = [a_i, b_i] (conjugated with conjugate_a), right j = [b_j, +/-a_j].
+    const std::size_t e=2*(bits/8+12),at=bits/8+4;const auto* a=static_cast<const unsigned char*>(A);const auto* b=static_cast<const unsigned char*>(B);
+    auto element=[&](const unsigned char* base,std::size_t off,std::size_t ld,std::size_t i,std::size_t q){return base+(off+(rows?i*ld+q:q*ld+i))*e;};
+    // -a_j as a complex element (both parts negated): materialized per line in a negated copy of A.
+    std::vector<unsigned char> neg;const unsigned char* an=a;std::size_t an_off=spec.a_offset;
+    if(skew&&n&&k){neg.resize(n*k*e);impl->pool_workers();
+        parallel(impl->threads(),n,[&](std::size_t i0,std::size_t i1){for(std::size_t i=i0;i<i1;++i)for(std::size_t q=0;q<k;++q){
+            unsigned char* d=neg.data()+(i*k+q)*e;std::memcpy(d,element(a,spec.a_offset,lda,i,q),e);
+            for(int part=0;part<2;++part){int s;std::memcpy(&s,d+part*(e/2)+at,4);s=-s;std::memcpy(d+part*(e/2)+at,&s,4);}}});
+        an=neg.data();an_off=0;}
+    auto left=[&](std::size_t i,std::size_t q){return q<k?element(a,spec.a_offset,lda,i,q):element(b,spec.b_offset,ldb,i,q-k);};
+    auto right=[&](std::size_t j,std::size_t q)->const unsigned char*{if(q<k)return element(b,spec.b_offset,ldb,j,q);
+        return skew?an+(an_off+j*k+(q-k))*e:element(a,spec.a_offset,lda,j,q-k);};
+    void* c=C?static_cast<unsigned char*>(C)+spec.c_offset*e:nullptr;
+    return impl->complex_run(bits,n,n,2*k,left,right,spec.conjugate_a,false,c,ldc,update_mode(spec.update),triangle_code(spec.triangle),spec.require_gpu);
 }
 namespace {
 void check_block(const char* what,const void* p,std::size_t rows,std::size_t cols,std::size_t& ld){
@@ -384,7 +440,7 @@ void Linalg::axpy_block(int bits,const void* alpha,const void* X,std::size_t ldx
         dot(alpha,0,x+(i*ldx+j)*e,0,1,y+(i*ldy+j)*e,2);});
 }
 Timing Linalg::Impl::run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,std::size_t K,void* C,bool syrk,bool lower_only,bool sub_only,std::size_t stride,bool require_gpu,
-                         bool add,int tri){@autoreleasepool{
+                         bool add,int tri,int col_shift){@autoreleasepool{
     const bool sub=sub_only||add;const int mode=add?2:sub?1:0;if(syrk)tri=1; // sub: an update (reads the old C); SYRK assembles the lower triangle, then mirrors
     auto start=Clock::now();report=LinalgReport{};report.m=M;report.n=Nc;report.k=K;if(!stride)stride=Nc;pool_workers();
     const std::size_t limit=std::size_t(1)<<31;if(M>=limit||Nc>=limit||K>=limit||M*stride>=limit)throw std::invalid_argument("matrix dimensions exceed 32-bit indexing");
@@ -461,7 +517,7 @@ Timing Linalg::Impl::run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,s
             [enc dispatchThreads:MTLSizeMake(w,h,d) threadsPerThreadgroup:MTLSizeMake(32,std::min<NSUInteger>(8,p.maxTotalThreadsPerThreadgroup/32),1)];};
         Params p{};p.rows=std::uint32_t(Me);p.cols=std::uint32_t(Ne);p.K=std::uint32_t(K);p.Kp=std::uint32_t(Kp);p.Mp=std::uint32_t(Mp);p.Np=std::uint32_t(Np);
         p.L=L;p.Wc=Wc;p.tri=syrk;p.lower=syrk?1:std::uint32_t(tri);p.both=syrk;p.add=add;p.ls_line=std::uint32_t(gl.line_stride);p.ls_k=std::uint32_t(gl.k_stride);
-        p.rs_line=std::uint32_t(gr.line_stride);p.rs_k=std::uint32_t(gr.k_stride);p.out_cols=std::uint32_t(Nc);p.multi_rows=std::uint32_t(ls.multi);p.multi_cols=std::uint32_t(rs.multi);p.out_stride=std::uint32_t(ostride);
+        p.rs_line=std::uint32_t(gr.line_stride);p.rs_k=std::uint32_t(gr.k_stride);p.out_cols=std::uint32_t(Nc);p.multi_rows=std::uint32_t(ls.multi);p.multi_cols=std::uint32_t(rs.multi);p.out_stride=std::uint32_t(ostride);p.col_shift=std::uint32_t(col_shift);
         const std::uint32_t st[4]={std::uint32_t(2*hp),std::uint32_t(hp),std::uint32_t(rp),0};
         for(unsigned j0=0;j0<L;j0+=B){
             // Digits of the extended operands for moduli j0 .. j0+count-1 (grid z: groups of `group` moduli), then the residues.
@@ -489,7 +545,7 @@ Timing Linalg::Impl::run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,s
     t=Clock::now();std::atomic<std::size_t> next{0},gpu_count{0},multi_count{0},fallback_count{0},trivial_count{0};std::atomic<double> fallback_time{0};
     const unsigned char* o=out?static_cast<const unsigned char*>(out.contents)+out_offset:nullptr;auto* c=static_cast<unsigned char*>(C);DotFn dot=dot_function(N);
     auto worker=[&](std::size_t,std::size_t){std::size_t g=0,mu=0,fb=0,tr=0;double ft=0;
-        for(std::size_t i;(i=next.fetch_add(1))<M;)for(std::size_t j=tri==2?i:0;j<(tri==1?i+1:Nc);++j){
+        for(std::size_t i;(i=next.fetch_add(1))<M;)for(std::size_t j=tri==2?i<<col_shift:0;j<(tri==1?std::min(Nc,(i+1)<<col_shift):Nc);++j){
             unsigned char* dst=c+(i*stride+j)*eb;std::uint8_t ci=ls.cls[i],cj=rs.cls[j];
             // A zero line leaves an update unchanged; a status line gives zero with the statuses (and the old entry's).
             if(ci==1||cj==1){word st=ls.status[i]|rs.status[j],old=0;std::memcpy(&old,dst+4*N+8,4);if(sub)st|=old;
@@ -991,6 +1047,7 @@ template<class I> struct Claim {
 LinalgTicket Linalg::encode_product(CommandBatch& batch,int bits,bool syrk,bool ta,const detail::Operand& A,const detail::Operand& B,std::size_t M,std::size_t Nc,
                                     std::size_t K,const detail::Operand& C,bool lower_only,bool sub,const GemmSpec* spec){@autoreleasepool{
     using detail::Internal;check_bits(bits);
+    if(spec&&(spec->conjugate_a||spec->conjugate_b))throw std::invalid_argument("resident gemm: conjugation applies to complex products");
     if(spec&&spec->require_gpu)throw std::invalid_argument("resident gemm: require_gpu is not supported (host fallback is decided inside the batch)");
     // Views: SYRK lines are columns of A (K x M); GEMM lines are rows of op(A) and columns of op(B) (gemm_views; the plain form
     // is a packed GemmSpec). Offsets and the row stride of C address submatrices of the buffers.

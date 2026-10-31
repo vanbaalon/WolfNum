@@ -8,6 +8,10 @@
   rank-2k updates with one rounding per entry, and multithreaded exact `negate_block`/`copy_block`
   and one-rounding `axpy_block`. Existing entry points, defaults and rounding are unchanged;
   internally, strided host views not in a resident buffer are now packed rather than rejected.
+  Add `Linalg::gemm_complex` and `syr2k_complex` for large complex host arrays with the same views,
+  updates and triangles plus conjugation (`GemmSpec::conjugate_a/b`). Each real and imaginary part
+  is one rounding of its exact dot, computed as one packed real product (2.6x the real GPU time at
+  256 bits, n = 1024, k = 256).
   Triangular products also skip int8 residue tiles outside the triangle (0.57-0.60x the full GPU
   time at 256 bits, k = 256, n = 1024/2048 on a loaded host).
   Validation: `tests/test_gemm_spec.cpp` (new) against MPFR at 256/1152 bits on GPU, forced-host

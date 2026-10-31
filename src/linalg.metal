@@ -14,7 +14,7 @@ template<int W> inline Number<N> round_sum(thread const Exact<W>& x,Number<N> c)
     Exact<ADDEND_WORDS> y=exact_number<ADDEND_WORDS>(c);
     return round_exact<N>(exact_add<N,sum_words(exact_words(N,W,ADDEND_WORDS))>(x,y));
 }
-struct Params { uint rows,cols,K,Kp,Mp,Np,j,L,Wc,tri,lower,fold,ls_line,ls_k,rs_line,rs_k,out_cols,multi_rows,multi_cols,both,j0,group,upper,row0,col0,out_stride,add; };
+struct Params { uint rows,cols,K,Kp,Mp,Np,j,L,Wc,tri,lower,fold,ls_line,ls_k,rs_line,rs_k,out_cols,multi_rows,multi_cols,both,j0,group,upper,row0,col0,out_stride,add,col_shift; };
 // Per line (row of the left / column of the right operand): bands (0 = handled on the host), lowest band
 // exponent, accumulator slot (>= 0: index among multi-band lines; < 0: -1 - index among single-band lines).
 struct Line { int bands,low,slot; };
@@ -78,7 +78,7 @@ kernel void product_residue(device int8_t* lcat [[buffer(0)]],device int8_t* a1 
     if(p.tri&&int(tgid.y)*64+63<int(tgid.x)*32)return;
     if(p.lower&&!p.both){int rlo=INT_MAX,rhi=INT_MIN,clo=INT_MAX,chi=INT_MIN; // uniform over the threadgroup
         for(uint r=tgid.y*64;r<min(tgid.y*64+64,p.rows);++r){int l=lband[r].line;rlo=min(rlo,l);rhi=max(rhi,l);}
-        for(uint c=tgid.x*32;c<min(tgid.x*32+32,p.cols);++c){int l=rband[c].line;clo=min(clo,l);chi=max(chi,l);}
+        for(uint c=tgid.x*32;c<min(tgid.x*32+32,p.cols);++c){int l=rband[c].line>>p.col_shift;clo=min(clo,l);chi=max(chi,l);}
         if(rlo>rhi||clo>chi||(p.lower==1?rhi<clo:rlo>chi))return;}
     const int M=int(p.Mp),Nn=int(p.Np),K=int(p.Kp);const ulong z=tgid.z;
     lcat+=z*st.x;a1+=z*st.y;a0+=z*st.y;rcat+=z*st.z;
@@ -118,7 +118,8 @@ inline long slot_of(Line li,Line lj,uint j,constant Params& p){
 // (symmetric range), then either one rounding (single-band row and column) or exact two's-complement accumulation at its
 // offset from the lowest bands. One dispatch never maps two entries to the same output.
 // p.fold (SYRK pair b > c): entry (i, j) with i < j is the (c, b) term of output (j, i); diagonal entries count twice.
-// p.lower: 1 writes outputs i >= j only, 2 (triangular GEMM) outputs i <= j only.
+// p.lower: 1 writes outputs i >= j only, 2 (triangular GEMM) outputs i <= j only, with j = column >> p.col_shift (complex
+// products: real columns 2j and 2j+1 belong to complex column j).
 kernel void reconstruct(device const ushort* res [[buffer(0)]],device const uint* moduli [[buffer(11)]],device const uint* inv [[buffer(2)]],
                         device const uint* bounds [[buffer(3)]],device const Member* lband [[buffer(4)]],constant Params& p [[buffer(5)]],
                         device const Member* rband [[buffer(6)]],device const Line* lline [[buffer(7)]],device const Line* rline [[buffer(8)]],
@@ -127,7 +128,7 @@ kernel void reconstruct(device const ushort* res [[buffer(0)]],device const uint
     uint c=g.x,r=g.y;if(r>=p.rows||c>=p.cols||(p.tri&&r<c))return;
     // A folded pair is reconstructed in two dispatches (p.upper = 0: entries i >= j, 1: i < j) so that no two threads of one
     // dispatch accumulate into the same output.
-    Member a=lband[p.row0+r],b=rband[p.col0+c];if(p.lower&&(p.fold?(a.line<b.line)!=bool(p.upper):p.lower==2?a.line>b.line:a.line<b.line))return;
+    Member a=lband[p.row0+r],b=rband[p.col0+c];if(p.lower&&(p.fold?(a.line<b.line)!=bool(p.upper):p.lower==2?a.line>(b.line>>p.col_shift):a.line<(b.line>>p.col_shift)))return;
     ulong MN=ulong(p.Mp)*p.Np,idx=ulong(p.row0+r)*p.Np+p.col0+c;uint L=p.L,Wc=p.Wc;uint v[LF_MAX_MODULI];
     for(uint j=0;j<L;++j){uint m=moduli[j],cm=recips[j],t=res[ulong(j)*MN+idx];
         for(uint i=0;i<j;++i){uint u=v[i]>=m?v[i]-m:v[i];t=t>=u?t-u:t+m-u;t=reduce32(t*inv[i*LF_MAX_MODULI+j],m,cm);}v[j]=t;}
@@ -152,7 +153,7 @@ kernel void reconstruct(device const ushort* res [[buffer(0)]],device const uint
 // Multi-band outputs: one rounding of the accumulated exact sum (or of the update).
 kernel void finish(device const Line* lline [[buffer(7)]],device const Line* rline [[buffer(8)]],device Number<N>* out [[buffer(9)]],
                    device const uint* acc [[buffer(10)]],constant Params& p [[buffer(5)]],uint2 g [[thread_position_in_grid]]){
-    uint j=g.x,i=g.y;if(i>=p.rows||j>=p.cols||(p.lower==1&&i<j)||(p.lower==2&&i>j))return;
+    uint j=g.x,i=g.y;if(i>=p.rows||j>=p.cols||(p.lower==1&&i<(j>>p.col_shift))||(p.lower==2&&i>(j>>p.col_shift)))return;
     Line li=lline[i],lj=rline[j];if(li.bands<1||lj.bands<1||(li.bands==1&&lj.bands==1))return;
     device const uint* s=acc+slot_of(li,lj,j,p)*LF_ACC_WORDS;word m[LF_ACC_WORDS];
     for(int k=0;k<LF_ACC_WORDS;++k)m[k]=s[k];
