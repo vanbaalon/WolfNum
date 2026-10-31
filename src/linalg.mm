@@ -130,6 +130,7 @@ struct PageBlock {
     PageBlock(PageBlock&& o)noexcept:p(o.p),bytes(o.bytes){o.p=nullptr;o.bytes=0;}
     PageBlock& operator=(PageBlock&& o)noexcept{std::swap(p,o.p);std::swap(bytes,o.bytes);return *this;}
 };
+struct LUData {Linalg* owner=nullptr;int bits=0,sign=1;std::size_t n=0,nb=0;LUInfo info;FactorOptions options;PageBlock lu;std::vector<std::size_t> perm;};
 struct QRData {Linalg* owner=nullptr;int bits=0;std::size_t m=0,n=0,nb=0;QRInfo info;QROptions options;PageBlock v,r,t,tau;std::vector<std::size_t> perm;};
 }
 // Resident products: per ceil(log2 K), the modulus count, Wc and bounds offset for every widest band width pmax in [0, G].
@@ -249,7 +250,10 @@ struct Linalg::Impl {
     template<class Left,class Right> Timing complex_run(int bits,std::size_t M,std::size_t Nc,std::size_t K,Left left,Right right,bool conj_l,bool conj_r,
                                                         void* C,std::size_t ldc,int mode,int tri,bool require_gpu);
     template<int N> CholeskyInfo cholesky_n(const Number<N>* A,std::size_t n,Number<N>* L,const FactorOptions& fo);
-    template<int N> Timing solve_n(const Number<N>* L,std::size_t n,const Number<N>* B,std::size_t nrhs,Number<N>* X,const FactorOptions& fo,int passes,bool upper=false);
+    template<int N> Timing solve_n(const Number<N>* L,std::size_t n,const Number<N>* B,std::size_t nrhs,Number<N>* X,const FactorOptions& fo,int passes,bool upper=false,bool unit=false);
+    // Blocked LU with partial pivoting (lu_n) and its solve (lu_solve_n); docs/numerics.md, "LU factorization".
+    template<int N> void lu_n(const Number<N>* A,std::size_t n,detail::LUData& f);
+    template<int N> Timing lu_solve_n(const detail::LUData& f,const Number<N>* B,std::size_t nrhs,Number<N>* X);
     // Householder QR (qr_n), one compact-WY block applied to columns [c0, c1) of X (qr_block), Q or Q^T applied to C (qr_apply_n).
     template<int N> void qr_n(const Number<N>* A,std::size_t m,std::size_t n,detail::QRData& f);
     template<int N> Timing qr_block(const detail::QRData& f,std::size_t b,Number<N>* X,std::size_t ld,std::size_t c0,std::size_t c1,bool qt,Number<N>* Wb,Number<N>* Yb,double threshold,bool gpu,bool& on_gpu,bool have_y=false);
@@ -609,8 +613,9 @@ template<int N> CholeskyInfo Linalg::Impl::cholesky_n(const Number<N>* A,std::si
     info.timing.wall_seconds=since(start);return info;
 }}
 // passes: 1 = L X = B (forward), 2 = L^T X = B (backward), 3 = both (forward first). upper (backward only): L holds an upper
-// triangular R = L^T itself (row i of R in place of column i of L; the same sequence).
-template<int N> Timing Linalg::Impl::solve_n(const Number<N>* L,std::size_t n,const Number<N>* B,std::size_t nrhs,Number<N>* X,const FactorOptions& fo,int passes,bool upper){@autoreleasepool{
+// triangular R = L^T itself (row i of R in place of column i of L; the same sequence). unit (forward only): L has a unit
+// diagonal, which is not read (x_i = D(b_i; l_i, x; [r0, i)), no division: the LU forward solve).
+template<int N> Timing Linalg::Impl::solve_n(const Number<N>* L,std::size_t n,const Number<N>* B,std::size_t nrhs,Number<N>* X,const FactorOptions& fo,int passes,bool upper,bool unit){@autoreleasepool{
     using T=Number<N>;auto start=Clock::now();Timing timing{0,0};if(!n||!nrhs)return timing;
     const std::size_t nb=fo.block?std::min(fo.block,n):n;Residency keep(*this);const T* F=L;T* W=X;pool_workers();
     const bool gpu=fo.gpu&&n>nb&&double(n-nb)*double(nrhs)*double(nb)>=fo.solve_host_macs;
@@ -628,7 +633,7 @@ template<int N> Timing Linalg::Impl::solve_n(const Number<N>* L,std::size_t n,co
         else each(M,[&](std::size_t i){for(std::size_t c=0;c<nrhs;++c)out[i*nrhs+c]=D(out[i*nrhs+c],base+i*line_stride,std::ptrdiff_t(k_stride),W+r0*nrhs+c,std::ptrdiff_t(nrhs),K);});};
     // Forward: x_i = RN(D(b_i; l_i, x; [r0, i)) / l_ii) within block [r0, r1), then b_i = D(b_i; l_i, x; [r0, r1)) for i >= r1.
     if(passes&1)for(std::size_t r0=0;r0<n;r0+=nb){const std::size_t r1=std::min(n,r0+nb);
-        each(nrhs,[&](std::size_t c){for(std::size_t i=r0;i<r1;++i){T& x=W[i*nrhs+c];x=div(D(x,F+i*n+r0,1,W+r0*nrhs+c,std::ptrdiff_t(nrhs),i-r0),F[i*n+i]);}});
+        each(nrhs,[&](std::size_t c){for(std::size_t i=r0;i<r1;++i){T& x=W[i*nrhs+c];x=D(x,F+i*n+r0,1,W+r0*nrhs+c,std::ptrdiff_t(nrhs),i-r0);if(!unit)x=div(x,F[i*n+i]);}});
         update(F+r1*n+r0,n,1,n-r1,r0,r1-r0,W+r1*nrhs);}
     // Backward (L^T): x_i = RN(D(b_i; column i of L, x; (i, r1)) / l_ii) from the last block, then b_i = D(b_i; column i, x; [r0, r1)) for i < r0.
     if(passes&2)for(std::size_t r0=(n-1)/nb*nb;;r0-=nb){const std::size_t r1=std::min(n,r0+nb);
@@ -638,6 +643,56 @@ template<int N> Timing Linalg::Impl::solve_n(const Number<N>* L,std::size_t n,co
     if(W!=X)std::memcpy(static_cast<void*>(X),W,n*nrhs*sizeof(T));
     timing.wall_seconds=since(start);return timing;
 }}
+// ---- Blocked LU with partial pivoting (docs/numerics.md, "LU factorization") ----
+// D as for Cholesky. Block [k0, k1): column j of the panel takes u_ij = D(a_ij; l_i, u_j; [k0, i)) for rows i in [k0, j), then the
+// candidates s_ij = D(a_ij; l_i, u_j; [k0, j)) for rows i >= j; the pivot row is the largest |s_ij| (exact comparison, the lowest
+// row on ties), swapped whole; then l_ij = RN(s_ij / u_jj) for i > j (no division for a zero pivot: the column is zero). U rows
+// [k0, k1) right of the block: u_ij = D(a_ij; l_i, u_j; [k0, i)) in row order. Trailing matrix: a_ij = D(a_ij; l_i, u_j; [k0, k1)),
+// on the GPU (run) or the host: identical bits, so only block changes a result.
+template<int N> void Linalg::Impl::lu_n(const Number<N>* A,std::size_t n,detail::LUData& f){@autoreleasepool{
+    using T=Number<N>;auto start=Clock::now();LUInfo& info=f.info;info.zero_pivot=info.status_column=n;const FactorOptions& fo=f.options;const std::size_t nb=f.nb;
+    T* W=static_cast<T*>(f.lu.p);Residency keep(*this);pool_workers();
+    each(n,[&](std::size_t i){std::memcpy(static_cast<void*>(W+i*n),A+i*n,n*sizeof(T));});
+    f.perm.resize(n);for(std::size_t i=0;i<n;++i)f.perm[i]=i;f.sign=1;
+    const bool gpu=fo.gpu&&n>nb&&double(n-nb)*double(n-nb)*double(nb)>=fo.host_macs;
+    if(gpu){id<MTLBuffer> b=wrap(W,n*n*sizeof(T));if(!b)throw std::runtime_error("Metal buffer wrap failed (lu)");resident.push_back(b);}
+    auto D=[](const T& c,const T* x,std::ptrdiff_t sx,const T* y,std::ptrdiff_t sy,std::size_t K){return exact_dot_add<N>(&c,true,x,sx,y,sy,K);};
+    std::size_t stop=n;
+    for(std::size_t k0=0;k0<n&&stop==n;k0+=nb){const std::size_t k1=std::min(n,k0+nb);auto t=Clock::now();++info.blocks;
+        for(std::size_t j=k0;j<k1;++j){
+            for(std::size_t i=k0;i<j;++i)W[i*n+j]=D(W[i*n+j],W+i*n+k0,1,W+k0*n+j,std::ptrdiff_t(n),i-k0);
+            each(n-j,[&](std::size_t r){const std::size_t i=j+r;W[i*n+j]=D(W[i*n+j],W+i*n+k0,1,W+k0*n+j,std::ptrdiff_t(n),j-k0);});
+            word st=0;std::size_t p=j;for(std::size_t i=j;i<n;++i){st|=W[i*n+j].status;if(magnitude_compare(W[i*n+j],W[p*n+j])>0)p=i;}
+            if(st){stop=j;info.status_column=j;info.status=st;break;}
+            if(p!=j){std::swap_ranges(W+p*n,W+p*n+n,W+j*n);std::swap(f.perm[p],f.perm[j]);f.sign=-f.sign;}
+            const T pivot=W[j*n+j];
+            if(!pivot.sign){if(info.zero_pivot==n)info.zero_pivot=j;continue;}
+            each(n-j-1,[&](std::size_t r){T& x=W[(j+1+r)*n+j];x=div(x,pivot);});
+        }
+        if(stop<n){info.panel_seconds+=since(t);break;}
+        // U rows of the block, in chunks of 32 columns.
+        each((n-k1+31)/32,[&](std::size_t q){const std::size_t c0=k1+32*q,c1=std::min(n,c0+32);
+            for(std::size_t i=k0;i<k1;++i)for(std::size_t c=c0;c<c1;++c)W[i*n+c]=D(W[i*n+c],W+i*n+k0,1,W+k0*n+c,std::ptrdiff_t(n),i-k0);});
+        info.panel_seconds+=since(t);
+        if(k1==n)break;
+        t=Clock::now();const std::size_t m=n-k1,K=k1-k0;const bool on_gpu=gpu&&double(m)*double(m)*double(K)>=fo.host_macs;
+        if(on_gpu){auto* base=reinterpret_cast<const unsigned char*>(W);
+            Timing tm=run(32*N,View{base+(k1*n+k0)*sizeof(T),sizeof(T),n,1,N},View{base+(k0*n+k1)*sizeof(T),sizeof(T),1,n,N},m,m,K,W+k1*n+k1,false,false,true,n);
+            info.timing.gpu_seconds+=tm.gpu_seconds;++info.gpu_updates;}
+        else{each(m,[&](std::size_t r){const std::size_t i=k1+r;for(std::size_t c=k1;c<n;++c)W[i*n+c]=D(W[i*n+c],W+i*n+k0,1,W+k0*n+c,std::ptrdiff_t(n),K);});++info.host_updates;}
+        info.update_seconds+=since(t);
+    }
+    if(stop<n)each(n,[&](std::size_t i){for(std::size_t c=stop;c<n;++c)W[i*n+c]=zero<N>(invalid);});
+    info.timing.wall_seconds=since(start);
+}}
+template<int N> Timing Linalg::Impl::lu_solve_n(const detail::LUData& f,const Number<N>* B,std::size_t nrhs,Number<N>* X){
+    using T=Number<N>;auto start=Clock::now();const std::size_t n=f.n;Timing timing{0,0};if(!n||!nrhs)return timing;pool_workers();
+    if(f.info.status_column<n){each(n,[&](std::size_t i){for(std::size_t c=0;c<nrhs;++c)X[i*nrhs+c]=zero<N>(invalid);});timing.wall_seconds=since(start);return timing;}
+    each(n,[&](std::size_t i){std::memcpy(static_cast<void*>(X+i*nrhs),B+f.perm[i]*nrhs,nrhs*sizeof(T));});
+    FactorOptions fo=f.options;fo.block=f.nb;const T* F=static_cast<const T*>(f.lu.p);
+    const Timing a=solve_n<N>(F,n,X,nrhs,X,fo,1,false,true),b=solve_n<N>(F,n,X,nrhs,X,fo,2,true);
+    timing.gpu_seconds=a.gpu_seconds+b.gpu_seconds;timing.wall_seconds=since(start);return timing;
+}
 // ---- Householder QR (docs/numerics.md, "QR factorization and least squares") ----
 // P(x, y; S) = RN(sum x_k y_k) and D(c; x, y; S) = RN(c - sum x_k y_k), one rounding each (exact_dot / exact_dot_add or
 // the GPU products: identical bits). Block b holds reflectors [k0, k0+kb), k0 = b nb; V_b, T_b as stored in the factor.
@@ -946,6 +1001,32 @@ Timing Linalg::cholesky_solve(int bits,const void* L,std::size_t n,const void* B
     return by_words(bits/32,[&](auto w){constexpr int N=decltype(w)::value;
         return impl->solve_n<N>(static_cast<const Number<N>*>(L),n,static_cast<const Number<N>*>(B),nrhs,static_cast<Number<N>*>(X),o,3);});
 }
+LUFactor Linalg::factor_lu(int bits,const void* A,std::size_t n,const FactorOptions& o){
+    check_bits(bits);check_size(n,1);if(n&&!A)throw std::invalid_argument("null matrix");
+    LUFactor u;u.d=std::make_unique<detail::LUData>();auto& f=*u.d;f.owner=this;f.bits=bits;f.n=n;f.nb=o.block?std::min(o.block,n):n;f.options=o;
+    f.lu=detail::PageBlock(n*n*std::size_t(bits/8+12));
+    by_words(bits/32,[&](auto w){constexpr int N=decltype(w)::value;impl->lu_n<N>(static_cast<const Number<N>*>(A),n,f);});
+    return u;
+}
+LUFactor::LUFactor()=default;LUFactor::~LUFactor()=default;LUFactor::LUFactor(LUFactor&&)noexcept=default;LUFactor& LUFactor::operator=(LUFactor&&)noexcept=default;
+static const detail::LUData& lu_data(const std::unique_ptr<detail::LUData>& d){if(!d)throw std::logic_error("empty LU factor");return *d;}
+bool LUFactor::empty()const{return !d;}
+int LUFactor::bits()const{return lu_data(d).bits;}
+std::size_t LUFactor::size()const{return lu_data(d).n;}
+std::size_t LUFactor::block()const{return lu_data(d).nb;}
+const LUInfo& LUFactor::info()const{return lu_data(d).info;}
+bool LUFactor::nonsingular()const{const auto& f=lu_data(d);return f.info.zero_pivot==f.n&&f.info.status_column==f.n;}
+const void* LUFactor::lu()const{return lu_data(d).lu.p;}
+const std::size_t* LUFactor::permutation()const{return lu_data(d).perm.data();}
+int LUFactor::permutation_sign()const{return lu_data(d).sign;}
+Timing LUFactor::solve(const void* B,std::size_t nrhs,void* X)const{const auto& f=lu_data(d);check_size(f.n,nrhs);if(f.n&&nrhs&&(!B||!X))throw std::invalid_argument("null matrix");
+    return by_words(f.bits/32,[&](auto w){constexpr int N=decltype(w)::value;return f.owner->impl->lu_solve_n<N>(f,static_cast<const Number<N>*>(B),nrhs,static_cast<Number<N>*>(X));});}
+void LUFactor::determinant(void* out)const{const auto& f=lu_data(d);if(!out)throw std::invalid_argument("null output");
+    by_words(f.bits/32,[&](auto w){constexpr int N=decltype(w)::value;using T=Number<N>;const T* U=static_cast<const T*>(f.lu.p);T r;
+        if(f.info.status_column<f.n)r=zero<N>(invalid);
+        else if(!f.n){r=zero<N>();r.limb[N-1]=0x80000000u;r.sign=1;}
+        else{r=U[0];for(std::size_t i=1;i<f.n;++i)r=mul(r,U[i*f.n+i]);if(f.sign<0)r=negate(r);}
+        std::memcpy(out,&r,sizeof(T));});}
 QRFactor Linalg::factor_qr(int bits,const void* A,std::size_t m,std::size_t n,const QROptions& o){
     check_bits(bits);if(m<n)throw std::invalid_argument("factor_qr: rows >= columns required");check_size(n,m);if(m*n&&!A)throw std::invalid_argument("null matrix");
     if(o.rank_bits<0)throw std::invalid_argument("factor_qr: rank_bits >= 0");

@@ -86,6 +86,8 @@ measurements.
   arrays and Buffers, `transpose_b`, overwrite/add/subtract and lower- or upper-only output. Adds a
   one-rounding symmetric/skew `syr2k`, large complex `gemm_complex`/`syr2k_complex` (with conjugation) and multithreaded host `negate_block`/`copy_block`/`axpy_block`; see
   [strided, signed and triangular products](docs/numerics.md#strided-signed-and-triangular-products).
+- **Unreleased:** blocked LU with partial pivoting (`Linalg::factor_lu`): solves and determinants with a
+  documented rounding sequence and GPU trailing updates; see [LU factorization](docs/numerics.md#lu-factorization).
 - Real and complex Householder QR, optional column pivoting, reusable least-squares factors,
   multiple-right-hand-side solves and Q application (`linalg.hpp`). QR uses host panels
   and GPU/host updates; see [QR contracts](docs/numerics.md#qr-factorization-and-least-squares).

@@ -854,6 +854,57 @@ equal or up to 4 bits smaller. The blocked order is therefore numerically sound 
 The normwise backward error (−342 at 224 bits, −377 at 256) is not informative here because the
 column scaling makes `||A|| ||x||` far larger than the residual scale.
 
+## LU factorization
+
+`Linalg::factor_lu` (unreleased; `LIMBFORGE_LU_API`) factors a square real matrix with partial
+pivoting, `P A = L U` with unit lower `L`, into an owning `LUFactor`:
+
+```cpp
+LUFactor f = la.factor_lu(bits, A, n);   // FactorOptions: block, host_macs, solve_host_macs, gpu
+f.solve(B, nrhs, X);                     // A X = B
+Float<256> det; f.determinant(&det);     // sign(P) * prod u_ii
+f.lu(); f.permutation(); f.permutation_sign(); f.info();
+```
+
+**Rounding sequence.** `D(c; x, y; S) = RN(c - sum_{q in S} x_q y_q)`, one rounding of the exact value,
+as for Cholesky. For each column block `[k0, k1)`:
+
+1. **Panel column j:** the U entries `u_ij = D(a_ij; l_i, u_j; [k0, i))` for rows `i` in `[k0, j)` (in
+   row order), then the candidates `s_ij = D(a_ij; l_i, u_j; [k0, j))` for rows `i >= j`.
+2. **Pivot:** the row with the largest `|s_ij|`, by exact comparison with ties to the lowest row. The
+   whole row is swapped, and `l_ij = RN(s_ij / u_jj)` for `i > j`.
+3. **U rows** of the block to its right: `u_ij = D(a_ij; l_i, u_j; [k0, i))`, in row order.
+4. **Trailing matrix:** `a_ij = D(a_ij; l_i, u_j; [k0, k1))`, on the GPU (strided exact product) or the
+   host (exact dots). The two give identical bits, so the factor and permutation depend on `block` only.
+
+**Outcomes.**
+
+- **Zero pivot.** A zero pivot column (all candidates zero) is reported in `info().zero_pivot`. As in
+  LAPACK `xGETRF`, no division takes place and the factorization continues; `nonsingular()` is false.
+- **Status stop.** A status among a column's candidates stops the factorization at
+  `info().status_column`, with `info().status` the OR of the candidate statuses. Every entry in
+  that column and to its right becomes zero with status `invalid`; earlier columns are final.
+- **Solve.** `solve` permutes B and runs the unit-lower forward and upper backward substitutions,
+  blocked exactly as `trsm` (one rounding per block, then the in-block dot and a division by
+  `u_ii`). A singular factor divides by its zero pivot (`division_by_zero` statuses); a status
+  factor gives zero with status `invalid`.
+- **Determinant.** `determinant` multiplies the pivots in index order, rounding after each
+  multiplication (n - 1 roundings), then applies the permutation sign; an empty matrix gives 1.
+  Its relative error from the exact product of the computed pivots is at most about
+  `(n - 1) 2^-bits`.
+
+**Validation.** `tests/test_lu.cpp` replays the sequence column by column (left-looking) in MPFR, an
+operation order that differs from the right-looking driver. It requires bitwise agreement of the
+factor, permutation, sign, outcomes, solve and determinant at 256 and 1152 bits; matrix sizes 0 to
+70 with blocks 1 to 32 and a single block; and zero-column, duplicate-row and status inputs. GPU
+and host updates must give identical factors and solves.
+
+**Measured** (256 bits, loaded M5 Max host, random well-scaled entries): with the default block 32,
+n = 1024 takes 0.57 s and n = 2048 takes 2.26 s, of which 0.51 s is GPU time. The host panel and U
+rows take about two thirds of the wall time. They run before each trailing update, without the
+look-ahead overlap Cholesky uses (possible later: it needs deferred row swaps and changes no bits).
+Complex LU is not yet available.
+
 ## Polynomial values and jets
 
 ```cpp

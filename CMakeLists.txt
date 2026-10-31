@@ -179,6 +179,10 @@ if(BUILD_TESTING)
     add_executable(test_wolfnum_gemm_spec tests/test_gemm_spec.cpp)
     target_link_libraries(test_wolfnum_gemm_spec PRIVATE limbforge_reference)
     add_test(NAME gemm_spec_gpu COMMAND test_wolfnum_gemm_spec)
+    # Blocked LU with partial pivoting, solves and determinants against an MPFR replay of the same rounding sequence.
+    add_executable(test_wolfnum_lu tests/test_lu.cpp)
+    target_link_libraries(test_wolfnum_lu PRIVATE limbforge_reference)
+    add_test(NAME linalg_lu COMMAND test_wolfnum_lu)
     # Diagnostic only (plan A2): not a CTest; compares GPU product formulations with the CPU.
     add_executable(gpu_codegen_probe tests/gpu_codegen_probe.mm)
     target_include_directories(gpu_codegen_probe PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")

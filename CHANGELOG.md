@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add blocked LU with partial pivoting (`LIMBFORGE_LU_API`): `Linalg::factor_lu`, `LUFactor` with
+  `solve`, `determinant`, permutation and sign. The documented rounding sequence (one exact-dot
+  rounding per block, as Cholesky) depends only on the block size; trailing updates run on the GPU.
+  Validation: `tests/test_lu.cpp` (new) replays the sequence in MPFR at 256/1152 bits, bit for bit,
+  with GPU/host agreement; Cholesky and QR tests pass after the shared `trsm` gained a unit-diagonal
+  mode.
+
 - Add strided, signed and triangular products (`LIMBFORGE_GEMM_SPEC_API`): `Linalg::gemm` with a
   `GemmSpec` (leading dimensions and offsets on host arrays and resident Buffers, `transpose_b`,
   overwrite/add/subtract, lower/upper-only output). Add `Linalg::syr2k` for the symmetric and skew

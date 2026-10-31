@@ -1,6 +1,7 @@
 #pragma once
 #define LIMBFORGE_GPU_REQUIRED_GEMM_API 1
 #define LIMBFORGE_GEMM_SPEC_API 1
+#define LIMBFORGE_LU_API 1
 // Dense real products with one rounding per output (plan D6 via L1c): C[i][j] = RN(sum_k L[i][k]*R[k][j]),
 // or RN(C[i][j] - sum_k ...) as an update, computed exactly by an integer GEMM over residues (Metal TensorOps
 // int8) and rounded once, ties to even. Contract and algorithm: docs/numerics.md, "Dense products". Host arrays, and
@@ -122,6 +123,39 @@ struct GemmSpec {
 namespace detail { struct QRData; }
 namespace detail { struct LinalgHooks; } class ComplexQRFactor; // complex QR (end of this header, src/linalg_complex.mm)
 class Linalg;
+// Blocked LU with partial pivoting (docs/numerics.md, "LU factorization"): P A = L U with unit lower L. FactorOptions as Cholesky
+// (block, GPU/host split; the result depends on block only). Per-factor outcome: zero_pivot = the first column whose pivot is
+// zero (n if none; the factorization continues as LAPACK xGETRF, U is singular); status_column = the first column whose pivot
+// candidates carry a status (n if none; the factorization stops there: rows and columns >= status_column of the factor are zero
+// with status invalid, and status is the OR of that column's candidate statuses).
+struct LUInfo {
+    std::size_t zero_pivot=0,status_column=0; word status=0;
+    Timing timing{0,0};                       // gpu_seconds: summed command buffers; wall: whole call
+    std::size_t blocks=0,gpu_updates=0,host_updates=0;
+    double panel_seconds=0,update_seconds=0;  // host panels and U rows; trailing updates (GPU or host), wall
+};
+namespace detail { struct LUData; }
+// Owning LU factor of an n x n matrix. Like QRFactor it copies what it needs, uses the Linalg that made it (which must outlive
+// it) and follows the Linalg threading rule.
+class LUFactor {
+public:
+    LUFactor(); ~LUFactor(); LUFactor(LUFactor&&) noexcept; LUFactor& operator=(LUFactor&&) noexcept;
+    bool empty() const; int bits() const; std::size_t size() const; std::size_t block() const;
+    const LUInfo& info() const; bool nonsingular() const;   // no zero pivot and no status column
+    // Row-major Float<bits> n x n owned by the factor: strictly lower part = L (unit diagonal not stored), upper part = U.
+    const void* lu() const;
+    const std::size_t* permutation() const;  // row i of P A is row permutation()[i] of A
+    int permutation_sign() const;            // det(P) = +1 or -1
+    // X (n x nrhs) solves A X = B: X = P B, then L Y = X (unit lower) and U X = Y, each blocked as trsm (docs/numerics.md).
+    // A singular factor divides by its zero pivot (division_by_zero statuses); a status column gives zero with status invalid
+    // everywhere. X must not overlap B.
+    Timing solve(const void* B,std::size_t nrhs,void* X) const;
+    // det(A) = permutation_sign() * u_00 * u_11 * ... * u_{n-1,n-1}, the product rounded after each multiplication in index
+    // order (n - 1 roundings; empty matrix: 1). Writes one Float<bits()> to out. A status column gives zero with status invalid.
+    void determinant(void* out) const;
+private:
+    friend class Linalg; std::unique_ptr<detail::LUData> d;
+};
 // Owning QR factor of an m x n matrix (m >= n): Q = H_0 ... H_{n-1}, H_j = I - tau_j v_j v_j^T, and R. The factor copies
 // everything it needs and never refers to A again: when A changes, factor it again (no caching by address). It uses the
 // Linalg that made it (scratch buffers, GPU): that Linalg must outlive it, and calls follow the Linalg threading rule.
@@ -206,6 +240,8 @@ public:
     Timing trsm(int bits,bool transpose,const void* L,std::size_t n,const void* B,std::size_t nrhs,void* X,const FactorOptions& options={});
     // X solves (L L^T) X = B: trsm, then trsm with transpose.
     Timing cholesky_solve(int bits,const void* L,std::size_t n,const void* B,std::size_t nrhs,void* X,const FactorOptions& options={});
+    // LU with partial pivoting of A (n x n, row-major); A is only read. See LUFactor.
+    LUFactor factor_lu(int bits,const void* A,std::size_t n,const FactorOptions& options={});
     // Householder QR of A (m x n, row-major, m >= n); A is only read. info().rank reports rank deficiency.
     QRFactor factor_qr(int bits,const void* A,std::size_t m,std::size_t n,const QROptions& options={});
     // QR of the augmented Levenberg-Marquardt matrix [J; diag(d)] ((m+n) x n) for J (m x n) and the caller's diagonal d
@@ -264,7 +300,7 @@ private:
     CholeskyInfo cholesky_buffers(int bits,const detail::Operand& A,std::size_t n,const detail::Operand& L,const FactorOptions&);
     Timing solve_buffers(int bits,int passes,const detail::Operand& L,std::size_t n,const detail::Operand& B,std::size_t nrhs,const detail::Operand& X,const FactorOptions&);
     QRFactor factor_qr_buffer(int bits,const detail::Operand& A,std::size_t m,std::size_t n,const QROptions&);
-    friend class QRFactor; friend struct detail::LinalgHooks; struct Impl; std::unique_ptr<Impl> impl;
+    friend class QRFactor; friend class LUFactor; friend struct detail::LinalgHooks; struct Impl; std::unique_ptr<Impl> impl;
 };
 // ---- Exact dot product on the CPU: RN(sum_k a[k*sa]*b[k*sb]) with one rounding (the GPU fallback) ----
 namespace detail {
