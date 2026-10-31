@@ -14,7 +14,7 @@ template<int W> inline Number<N> round_sum(thread const Exact<W>& x,Number<N> c)
     Exact<ADDEND_WORDS> y=exact_number<ADDEND_WORDS>(c);
     return round_exact<N>(exact_add<N,sum_words(exact_words(N,W,ADDEND_WORDS))>(x,y));
 }
-struct Params { uint rows,cols,K,Kp,Mp,Np,j,L,Wc,tri,lower,fold,ls_line,ls_k,rs_line,rs_k,out_cols,multi_rows,multi_cols,both,j0,group,upper,row0,col0,out_stride; };
+struct Params { uint rows,cols,K,Kp,Mp,Np,j,L,Wc,tri,lower,fold,ls_line,ls_k,rs_line,rs_k,out_cols,multi_rows,multi_cols,both,j0,group,upper,row0,col0,out_stride,add; };
 // Per line (row of the left / column of the right operand): bands (0 = handled on the host), lowest band
 // exponent, accumulator slot (>= 0: index among multi-band lines; < 0: -1 - index among single-band lines).
 struct Line { int bands,low,slot; };
@@ -94,13 +94,13 @@ kernel void product_residue(device int8_t* lcat [[buffer(0)]],device int8_t* a1 
         uint v=reduce32(reduce(c11[i],m)<<16,m,cm)+reduce32(reduce(cmid[i],m)<<8,m,cm);v=(v>=m?v-m:v)+reduce(c00[i],m);
         out[ulong(r)*ulong(Nn)+c]=ushort(v>=m?v-m:v);}
 }
-// SUB (pipeline specialisation): outputs are updates RN(c - x) of the old output c, for the exact dot product
-// x = sign * X * 2^scale, with one rounding (round_sum). A status on c gives zero with that status.
+// SUB (pipeline specialisation): outputs are updates RN(c - x) (or RN(c + x) with p.add) of the old output c, for the exact
+// dot product x = sign * X * 2^scale, with one rounding (round_sum). A status on c gives zero with that status.
 constant bool SUB [[function_constant(0)]];
-template<int W> inline Number<N> rounded(thread const word (&X)[W],exponent_type scale,int sign,device const Number<N>& old){
+template<int W> inline Number<N> rounded(thread const word (&X)[W],exponent_type scale,int sign,device const Number<N>& old,bool add){
     if(!SUB)return pack<N>(X,scale,sign,ok);
     Number<N> c=old;if(c.status)return zero<N>(c.status);
-    Exact<W> x;for(int k=0;k<W;++k)x.w[k]=X[k];x.scale=scale;x.sign=highest(X)<0?0:-sign;
+    Exact<W> x;for(int k=0;k<W;++k)x.w[k]=X[k];x.scale=scale;x.sign=highest(X)<0?0:add?sign:-sign;
     return round_sum(x,c);
 }
 inline long slot_of(Line li,Line lj,uint j,constant Params& p){
@@ -110,6 +110,7 @@ inline long slot_of(Line li,Line lj,uint j,constant Params& p){
 // (symmetric range), then either one rounding (single-band row and column) or exact two's-complement accumulation at its
 // offset from the lowest bands. One dispatch never maps two entries to the same output.
 // p.fold (SYRK pair b > c): entry (i, j) with i < j is the (c, b) term of output (j, i); diagonal entries count twice.
+// p.lower: 1 writes outputs i >= j only, 2 (triangular GEMM) outputs i <= j only.
 kernel void reconstruct(device const ushort* res [[buffer(0)]],device const uint* moduli [[buffer(11)]],device const uint* inv [[buffer(2)]],
                         device const uint* bounds [[buffer(3)]],device const Member* lband [[buffer(4)]],constant Params& p [[buffer(5)]],
                         device const Member* rband [[buffer(6)]],device const Line* lline [[buffer(7)]],device const Line* rline [[buffer(8)]],
@@ -118,7 +119,7 @@ kernel void reconstruct(device const ushort* res [[buffer(0)]],device const uint
     uint c=g.x,r=g.y;if(r>=p.rows||c>=p.cols||(p.tri&&r<c))return;
     // A folded pair is reconstructed in two dispatches (p.upper = 0: entries i >= j, 1: i < j) so that no two threads of one
     // dispatch accumulate into the same output.
-    Member a=lband[p.row0+r],b=rband[p.col0+c];if(p.lower&&(p.fold?(a.line<b.line)!=bool(p.upper):a.line<b.line))return;
+    Member a=lband[p.row0+r],b=rband[p.col0+c];if(p.lower&&(p.fold?(a.line<b.line)!=bool(p.upper):p.lower==2?a.line>b.line:a.line<b.line))return;
     ulong MN=ulong(p.Mp)*p.Np,idx=ulong(p.row0+r)*p.Np+p.col0+c;uint L=p.L,Wc=p.Wc;uint v[LF_MAX_MODULI];
     for(uint j=0;j<L;++j){uint m=moduli[j],cm=recips[j],t=res[ulong(j)*MN+idx];
         for(uint i=0;i<j;++i){uint u=v[i]>=m?v[i]-m:v[i];t=t>=u?t-u:t+m-u;t=reduce32(t*inv[i*LF_MAX_MODULI+j],m,cm);}v[j]=t;}
@@ -129,7 +130,7 @@ kernel void reconstruct(device const ushort* res [[buffer(0)]],device const uint
     int sign=1;if(cmp>0){long borrow=0;for(uint k=0;k<Wc;++k){long d=long(full[k])-long(X[k])-borrow;X[k]=uint(d);borrow=d<0;}sign=-1;}
     int row=a.line,col=b.line,times=1;if(p.fold&&row<=col){times=row==col?2:1;row=b.line;col=a.line;}
     Line li=lline[row],lj=rline[col];
-    if(li.bands==1&&lj.bands==1){device Number<N>& o=out[ulong(row)*p.out_stride+col];o=rounded(X,exponent_type(a.lo)+b.lo-2*(32*N-1),sign,o);return;}
+    if(li.bands==1&&lj.bands==1){device Number<N>& o=out[ulong(row)*p.out_stride+col];o=rounded(X,exponent_type(a.lo)+b.lo-2*(32*N-1),sign,o,p.add);return;}
     device uint* s=acc+slot_of(li,lj,uint(col),p)*LF_ACC_WORDS;
     uint shift=uint(a.lo-lline[a.line].low)+uint(b.lo-rline[b.line].low),w=shift/32,sh=shift%32;
     for(int t=0;t<times;++t){ulong carry=0;
@@ -143,12 +144,12 @@ kernel void reconstruct(device const ushort* res [[buffer(0)]],device const uint
 // Multi-band outputs: one rounding of the accumulated exact sum (or of the update).
 kernel void finish(device const Line* lline [[buffer(7)]],device const Line* rline [[buffer(8)]],device Number<N>* out [[buffer(9)]],
                    device const uint* acc [[buffer(10)]],constant Params& p [[buffer(5)]],uint2 g [[thread_position_in_grid]]){
-    uint j=g.x,i=g.y;if(i>=p.rows||j>=p.cols||(p.lower&&i<j))return;
+    uint j=g.x,i=g.y;if(i>=p.rows||j>=p.cols||(p.lower==1&&i<j)||(p.lower==2&&i>j))return;
     Line li=lline[i],lj=rline[j];if(li.bands<1||lj.bands<1||(li.bands==1&&lj.bands==1))return;
     device const uint* s=acc+slot_of(li,lj,j,p)*LF_ACC_WORDS;word m[LF_ACC_WORDS];
     for(int k=0;k<LF_ACC_WORDS;++k)m[k]=s[k];
     int sign=1;if(m[LF_ACC_WORDS-1]>>31){sign=-1;ulong c=1;for(int k=0;k<LF_ACC_WORDS;++k){ulong t=ulong(~m[k])+c;m[k]=uint(t);c=t>>32;}}
-    device Number<N>& o=out[ulong(i)*p.out_stride+j];o=rounded(m,exponent_type(li.low)+lj.low-2*(32*N-1),sign,o);
+    device Number<N>& o=out[ulong(i)*p.out_stride+j];o=rounded(m,exponent_type(li.low)+lj.low-2*(32*N-1),sign,o,p.add);
 }
 // ---- Resident products (Linalg::syrk/gemm into an Engine's CommandBatch; docs/numerics.md "Resident products") ----
 // The host path's band analysis, member lists, modulus count and dispatch sizes, computed on the GPU so that one batch holds
@@ -257,13 +258,13 @@ kernel void plan_final(device const uint* ls [[buffer(0)]],device const uint* rs
     device uint* st=plan+64*(2+c.batches+pairs);st[0]=2*Mp*c.base.Kp;st[1]=Mp*c.base.Kp;st[2]=2*c.base.Kp*Np;st[3]=0;
 }
 // Zero / status lines (as the host assembly): an output with a zero or status line is zero with the OR of the line statuses
-// (and of the old entry for an update); an update by a zero line leaves the entry unchanged. SYRK: lower triangle.
-struct TrivialParams { uint M,Nc,syrk,sub; };
+// (and of the old entry for an update); an update by a zero line leaves the entry unchanged. tri: 1 lower (SYRK), 2 upper.
+struct TrivialParams { uint M,Nc,tri,sub,stride; };
 kernel void trivial_outputs(device const LineInfo* li [[buffer(0)]],device const LineInfo* ri [[buffer(1)]],device Number<N>* out [[buffer(2)]],
                             constant TrivialParams& p [[buffer(3)]],uint2 g [[thread_position_in_grid]]){
-    const uint j=g.x,i=g.y;if(i>=p.M||j>=p.Nc||(p.syrk&&j>i))return;
+    const uint j=g.x,i=g.y;if(i>=p.M||j>=p.Nc||(p.tri==1&&j>i)||(p.tri==2&&j<i))return;
     LineInfo a=li[i],b=ri[j];if(a.cls!=1&&b.cls!=1)return;
-    device Number<N>& o=out[ulong(i)*p.Nc+j];uint st=a.status|b.status;if(p.sub)st|=o.status;
+    device Number<N>& o=out[ulong(i)*p.stride+j];uint st=a.status|b.status;if(p.sub)st|=o.status;
     if(!p.sub||st)o=zero<N>(st);
 }
 // SYRK with the full matrix: the strict upper triangle copies the lower.

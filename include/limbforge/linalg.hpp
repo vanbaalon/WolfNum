@@ -1,5 +1,6 @@
 #pragma once
 #define LIMBFORGE_GPU_REQUIRED_GEMM_API 1
+#define LIMBFORGE_GEMM_SPEC_API 1
 // Dense real products with one rounding per output (plan D6 via L1c): C[i][j] = RN(sum_k L[i][k]*R[k][j]),
 // or RN(C[i][j] - sum_k ...) as an update, computed exactly by an integer GEMM over residues (Metal TensorOps
 // int8) and rounded once, ties to even. Contract and algorithm: docs/numerics.md, "Dense products". Host arrays, and
@@ -104,6 +105,19 @@ struct QRInfo {
     double panel_seconds=0,update_seconds=0;  // host panels; trailing updates (GPU or host), wall
     std::size_t norm_recomputations=0;        // pivoting: downdated norms recomputed from the reduced column
 };
+// Strided, signed and triangular products (Linalg::gemm with a GemmSpec, Linalg::syr2k; docs/numerics.md, "Strided, signed and
+// triangular products"). Every output is one rounding of its exact dot product, as gemm: overwrite C = RN(op(A) op(B)),
+// add C = RN(C + op(A) op(B)), subtract C = RN(C - op(A) op(B)). The default GemmSpec is gemm(bits,false,A,B,m,n,k,C).
+enum class GemmUpdate {overwrite,add,subtract};
+enum class Triangle {full,lower,upper};
+struct GemmSpec {
+    bool transpose_a=false,transpose_b=false;     // op(A) = A (stored m x k) or A^T (stored k x m); op(B) = B (k x n) or B^T (stored n x k)
+    std::size_t lda=0,ldb=0,ldc=0;                // row strides in elements of the stored row-major A, B and C; 0 = their column counts
+    std::size_t a_offset=0,b_offset=0,c_offset=0; // first element of A, B and C, in elements from the pointer (or buffer start)
+    GemmUpdate update=GemmUpdate::overwrite;
+    Triangle triangle=Triangle::full;             // m == n: only outputs i >= j (lower) or i <= j (upper) are computed and written
+    bool require_gpu=false;                       // host arrays: as gemm_gpu (host fallback throws before C changes); Buffer forms reject it
+};
 namespace detail { struct QRData; }
 namespace detail { struct LinalgHooks; } class ComplexQRFactor; // complex QR (end of this header, src/linalg_complex.mm)
 class Linalg;
@@ -158,6 +172,21 @@ public:
     // after analysis and before modifying C or issuing commands. Zero/status outputs may be assembled on the host.
     // Configure exponent bands with LinalgOptions; this entry point never loosens limits or changes precision.
     Timing gemm_gpu(int bits,bool transpose_a,const void* A,const void* B,std::size_t m,std::size_t n,std::size_t k,void* C,bool subtract=false);
+    // C (m x n) per GemmSpec: views of larger row-major matrices, either operand transposed, overwrite/add/subtract and lower- or
+    // upper-only output (the rest of C is untouched). C must not overlap A or B. Strided operands that are not inside a resident
+    // buffer are packed once (multithreaded); a strided page-aligned C is used in place.
+    Timing gemm(int bits,const void* A,const void* B,std::size_t m,std::size_t n,std::size_t k,void* C,const GemmSpec& spec);
+    // Rank-2k update with one rounding per entry: S = A^T B + B^T A (symmetric) or A^T B - B^T A (skew) for A and B (k x n), or with
+    // spec.transpose_a S = A B^T +/- B A^T for A and B (n x k); C (n x n) takes S per spec.update and spec.triangle (leading
+    // dimensions and offsets apply; transpose_b must be false). Each entry is the exact 2k-term dot of [A; B]^T [B; +/-A], packed
+    // once (O(nk) copies), so status lines follow gemm: entry (i, j) carries the statuses of lines i and j of A and B.
+    Timing syr2k(int bits,const void* A,const void* B,std::size_t n,std::size_t k,void* C,bool skew,const GemmSpec& spec={});
+    // Exact elementwise host utilities on row-major Float<bits> blocks (rows x cols; leading dimensions in elements, 0 = packed),
+    // multithreaded over the Linalg's workers. negate_block: X = -X in place. copy_block: Y = X, -X, X^T or -X^T (X is rows x cols,
+    // or cols x rows with transpose); Y must not overlap X. axpy_block: Y = RN(Y + alpha X) per entry, one rounding (statuses OR).
+    void negate_block(int bits,void* X,std::size_t rows,std::size_t cols,std::size_t ldx=0);
+    void copy_block(int bits,const void* X,std::size_t ldx,void* Y,std::size_t ldy,std::size_t rows,std::size_t cols,bool transpose=false,bool negate=false);
+    void axpy_block(int bits,const void* alpha,const void* X,std::size_t ldx,void* Y,std::size_t ldy,std::size_t rows,std::size_t cols);
     // Lower L (n x n, row-major) with A = L L^T from the lower triangle of symmetric positive definite A; the strict
     // upper triangle of L is set to zero. L may equal A (in place); otherwise they must not overlap.
     CholeskyInfo cholesky(int bits,const void* A,std::size_t n,void* L,const FactorOptions& options={});
@@ -193,6 +222,11 @@ public:
         return encode_product(batch,detail::real_bits<T>(),true,false,detail::Access::operand(A),detail::Access::operand(A),cols,cols,rows,detail::Access::operand(C),lower_only,subtract);}
     template<class T> LinalgTicket gemm(CommandBatch& batch,bool transpose_a,const Buffer<T>& A,const Buffer<T>& B,std::size_t m,std::size_t n,std::size_t k,Buffer<T>& C,bool subtract=false){
         return encode_product(batch,detail::real_bits<T>(),false,transpose_a,detail::Access::operand(A),detail::Access::operand(B),m,n,k,detail::Access::operand(C),false,subtract);}
+    // GemmSpec form on Buffer operands (offsets and leading dimensions address submatrices of the buffers). The resident rules
+    // above apply unchanged: A, B and C are distinct buffers, C is provisional until wait, and require_gpu throws invalid_argument.
+    template<class T> LinalgTicket gemm(CommandBatch& batch,const Buffer<T>& A,const Buffer<T>& B,std::size_t m,std::size_t n,std::size_t k,Buffer<T>& C,const GemmSpec& spec){
+        return encode_product(batch,detail::real_bits<T>(),false,spec.transpose_a,detail::Access::operand(A),detail::Access::operand(B),m,n,k,detail::Access::operand(C),false,
+                              spec.update!=GemmUpdate::overwrite,&spec);}
     // Factorizations and solves on Buffer operands: synchronous, outside any batch (the host panels run between dependent GPU
     // updates). The buffers must be idle; the call owns them like a submission until it returns (concurrent mapping or
     // submission throws logic_error), the GPU uses them in place (no copies) and the results equal the host-array calls bit for bit.
@@ -215,7 +249,7 @@ public:
     template<class T> Timing cholesky_solve_blocked(const Buffer<T>& L,std::size_t n,const Buffer<T>& B,std::size_t nrhs,Buffer<T>& X,const FactorOptions& o={}){return cholesky_solve(L,n,B,nrhs,X,o);}
 private:
     LinalgTicket encode_product(CommandBatch&,int bits,bool syrk,bool transpose_a,const detail::Operand& A,const detail::Operand& B,std::size_t m,std::size_t n,
-                                std::size_t k,const detail::Operand& C,bool lower_only,bool subtract);
+                                std::size_t k,const detail::Operand& C,bool lower_only,bool subtract,const GemmSpec* spec=nullptr);
     CholeskyInfo cholesky_buffers(int bits,const detail::Operand& A,std::size_t n,const detail::Operand& L,const FactorOptions&);
     Timing solve_buffers(int bits,int passes,const detail::Operand& L,std::size_t n,const detail::Operand& B,std::size_t nrhs,const detail::Operand& X,const FactorOptions&);
     QRFactor factor_qr_buffer(int bits,const detail::Operand& A,std::size_t m,std::size_t n,const QROptions&);

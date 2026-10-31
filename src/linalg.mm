@@ -26,7 +26,7 @@ namespace {
 using Clock=std::chrono::steady_clock;
 double since(Clock::time_point t){return std::chrono::duration<double>(Clock::now()-t).count();}
 std::string message(NSError* e){return e?std::string([[e localizedDescription] UTF8String]):"unknown Metal error";}
-struct Params {std::uint32_t rows,cols,K,Kp,Mp,Np,j,L,Wc,tri,lower,fold,ls_line,ls_k,rs_line,rs_k,out_cols,multi_rows,multi_cols,both,j0,group,upper,row0,col0,out_stride;};
+struct Params {std::uint32_t rows,cols,K,Kp,Mp,Np,j,L,Wc,tri,lower,fold,ls_line,ls_k,rs_line,rs_k,out_cols,multi_rows,multi_cols,both,j0,group,upper,row0,col0,out_stride,add;};
 struct Line {std::int32_t bands,low,slot;};
 struct Member {std::int32_t line,lo,hi;};
 constexpr std::size_t max_k=65472; // concatenated digit product: 2*Kp*2^14 < 2^31
@@ -110,10 +110,11 @@ Side analyze(const View& v,std::size_t lines,std::size_t K,const LinalgOptions& 
     return s;
 }
 // out = exact_dot(a, b), or with sub the update RN(out - dot) (out is read first).
-using DotFn=void(*)(const void*,std::ptrdiff_t,const void*,std::ptrdiff_t,std::size_t,void*,bool);
-template<int N> void dot_n(const void* a,std::ptrdiff_t sa,const void* b,std::ptrdiff_t sb,std::size_t K,void* out,bool sub){
+// mode: 0 out = dot, 1 (true) out = RN(out - dot), 2 out = RN(out + dot).
+using DotFn=void(*)(const void*,std::ptrdiff_t,const void*,std::ptrdiff_t,std::size_t,void*,int);
+template<int N> void dot_n(const void* a,std::ptrdiff_t sa,const void* b,std::ptrdiff_t sb,std::size_t K,void* out,int mode){
     auto* o=static_cast<Number<N>*>(out);Number<N> c=*o;
-    *o=exact_dot_add<N>(sub?&c:nullptr,sub,static_cast<const Number<N>*>(a),sa,static_cast<const Number<N>*>(b),sb,K);}
+    *o=exact_dot_add<N>(mode?&c:nullptr,mode==1,static_cast<const Number<N>*>(a),sa,static_cast<const Number<N>*>(b),sb,K);}
 template<int N> void dot_table(DotFn* t){t[N]=dot_n<N>;if constexpr(N<64)dot_table<N+1>(t);}
 DotFn dot_function(int words){static DotFn table[65]={};if(!table[2])dot_table<2>(table);return table[words];}
 // f(std::integral_constant<int, words>) for words in [2, 64].
@@ -237,8 +238,10 @@ struct Linalg::Impl {
         if(!b)throw std::runtime_error("Metal allocation failed ("+role+")");return b;}
     Kernels& get(int bits){return cache->get(bits);}
     const std::vector<std::uint32_t>& bounds(Kernels& k,int L,int Wc){return cache->bounds(k,L,Wc);}
-    // C[i*stride + j] (stride 0: Nc) = RN(dot), or RN(C - dot) with sub. Views and C inside a resident buffer are used in place.
-    Timing run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,std::size_t K,void* C,bool syrk,bool lower_only,bool sub=false,std::size_t stride=0,bool require_gpu=false);
+    // C[i*stride + j] (stride 0: Nc) = RN(dot), or RN(C - dot) with sub, RN(C + dot) with add. Views and C inside a resident buffer
+    // are used in place; other strided views are packed. tri (GEMM, M == Nc): 1 writes outputs i >= j only, 2 outputs i <= j only.
+    Timing run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,std::size_t K,void* C,bool syrk,bool lower_only,bool sub=false,std::size_t stride=0,bool require_gpu=false,
+               bool add=false,int tri=0);
     template<int N> CholeskyInfo cholesky_n(const Number<N>* A,std::size_t n,Number<N>* L,const FactorOptions& fo);
     template<int N> Timing solve_n(const Number<N>* L,std::size_t n,const Number<N>* B,std::size_t nrhs,Number<N>* X,const FactorOptions& fo,int passes,bool upper=false);
     // Householder QR (qr_n), one compact-WY block applied to columns [c0, c1) of X (qr_block), Q or Q^T applied to C (qr_apply_n).
@@ -307,7 +310,82 @@ Timing Linalg::gemm_gpu(int bits,bool transpose_a,const void* A,const void* B,st
     View lv=transpose_a?View{static_cast<const unsigned char*>(A),e,1,m,bits/32}:View{static_cast<const unsigned char*>(A),e,k,1,bits/32};
     return impl->run(bits,lv,{static_cast<const unsigned char*>(B),e,1,n,bits/32},m,n,k,C,false,false,subtract,0,true);
 }
-Timing Linalg::Impl::run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,std::size_t K,void* C,bool syrk,bool lower_only,bool sub,std::size_t stride,bool require_gpu){@autoreleasepool{
+namespace {
+// Strides of a GemmSpec: left lines are rows of op(A), right lines columns of op(B); element (line, k) as View.
+struct GemmViews {std::size_t ldc,ls_line,ls_k,rs_line,rs_k;};
+GemmViews gemm_views(const GemmSpec& s,std::size_t m,std::size_t n,std::size_t k,const char* what){
+    const std::size_t ac=s.transpose_a?m:k,bc=s.transpose_b?k:n,lda=s.lda?s.lda:ac,ldb=s.ldb?s.ldb:bc,ldc=s.ldc?s.ldc:n;
+    if(lda<ac||ldb<bc||ldc<n)throw std::invalid_argument(std::string(what)+": leading dimension below the stored column count");
+    if(std::max({lda,ldb,ldc})>=(std::size_t(1)<<31))throw std::invalid_argument(std::string(what)+": leading dimension exceeds 32-bit indexing");
+    if(s.triangle!=Triangle::full&&m!=n)throw std::invalid_argument(std::string(what)+": a triangular output needs m == n");
+    return {ldc,s.transpose_a?1:lda,s.transpose_a?lda:1,s.transpose_b?ldb:1,s.transpose_b?1:ldb};
+}
+int triangle_code(Triangle t){return t==Triangle::lower?1:t==Triangle::upper?2:0;}
+std::size_t view_extent(std::size_t lines,std::size_t K,std::size_t line_stride,std::size_t k_stride){return lines&&K?(lines-1)*line_stride+(K-1)*k_stride+1:0;}
+}
+Timing Linalg::gemm(int bits,const void* A,const void* B,std::size_t m,std::size_t n,std::size_t k,void* C,const GemmSpec& spec){
+    check_bits(bits);const GemmViews v=gemm_views(spec,m,n,k,"gemm");const std::size_t e=bits/8+12;
+    auto at=[&](const void* p,std::size_t offset){return p?static_cast<const unsigned char*>(p)+offset*e:nullptr;};
+    void* c=C?static_cast<unsigned char*>(C)+spec.c_offset*e:nullptr;
+    return impl->run(bits,{at(A,spec.a_offset),e,v.ls_line,v.ls_k,bits/32},{at(B,spec.b_offset),e,v.rs_line,v.rs_k,bits/32},m,n,k,c,false,false,
+                     spec.update==GemmUpdate::subtract,v.ldc,spec.require_gpu,spec.update==GemmUpdate::add,triangle_code(spec.triangle));
+}
+Timing Linalg::syr2k(int bits,const void* A,const void* B,std::size_t n,std::size_t k,void* C,bool skew,const GemmSpec& spec){
+    check_bits(bits);if(spec.transpose_b)throw std::invalid_argument("syr2k: transpose_b must be false");
+    // Lines are columns of A and B (k x n), or rows (n x k) with transpose_a.
+    const bool rows=spec.transpose_a;const std::size_t cols=rows?k:n,lda=spec.lda?spec.lda:cols,ldb=spec.ldb?spec.ldb:cols,ldc=spec.ldc?spec.ldc:n;
+    if(lda<cols||ldb<cols||ldc<n)throw std::invalid_argument("syr2k: leading dimension below the stored column count");
+    if(n&&k&&(!A||!B))throw std::invalid_argument("null input");
+    if(2*k>=(std::size_t(1)<<31)||n*2*k>=(std::size_t(1)<<31))throw std::invalid_argument("matrix dimensions exceed 32-bit indexing");
+    const int N=bits/32;const std::size_t e=bits/8+12,K2=2*k;
+    // Packed operands, line i = [a_i, b_i] and [b_i, +/-a_i]; resident scratch, so the product reads them in place.
+    Impl::Residency guard(*impl);id<MTLBuffer> lb=impl->buffer("syr2k_left",n*K2*e),rb=impl->buffer("syr2k_right",n*K2*e);
+    impl->resident.push_back(lb);impl->resident.push_back(rb);
+    auto* l=static_cast<unsigned char*>(lb.contents);auto* r=static_cast<unsigned char*>(rb.contents);
+    const auto* a=static_cast<const unsigned char*>(A)+(A?spec.a_offset*e:0);const auto* b=static_cast<const unsigned char*>(B)+(B?spec.b_offset*e:0);
+    auto element=[&](const unsigned char* base,std::size_t ld,std::size_t i,std::size_t q){return base+(rows?i*ld+q:q*ld+i)*e;};
+    impl->pool_workers();
+    parallel(impl->threads(),k?n:0,[&](std::size_t i0,std::size_t i1){for(std::size_t i=i0;i<i1;++i)for(std::size_t q=0;q<k;++q){
+        unsigned char *li=l+i*K2*e,*ri=r+i*K2*e;
+        std::memcpy(li+q*e,element(a,lda,i,q),e);std::memcpy(li+(k+q)*e,element(b,ldb,i,q),e);
+        std::memcpy(ri+q*e,element(b,ldb,i,q),e);std::memcpy(ri+(k+q)*e,element(a,lda,i,q),e);
+        if(skew){int sign;std::memcpy(&sign,ri+(k+q)*e+4*N+4,4);sign=-sign;std::memcpy(ri+(k+q)*e+4*N+4,&sign,4);}}});
+    void* c=C?static_cast<unsigned char*>(C)+spec.c_offset*e:nullptr;
+    return impl->run(bits,{l,e,K2,1,N},{r,e,K2,1,N},n,n,K2,c,false,false,spec.update==GemmUpdate::subtract,ldc,spec.require_gpu,
+                     spec.update==GemmUpdate::add,triangle_code(spec.triangle));
+}
+namespace {
+void check_block(const char* what,const void* p,std::size_t rows,std::size_t cols,std::size_t& ld){
+    if(!ld)ld=cols;if(ld<cols)throw std::invalid_argument(std::string(what)+": leading dimension below the column count");
+    if(rows&&cols&&!p)throw std::invalid_argument(std::string(what)+": null matrix");}
+}
+void Linalg::negate_block(int bits,void* X,std::size_t rows,std::size_t cols,std::size_t ldx){
+    check_bits(bits);check_block("negate_block",X,rows,cols,ldx);const std::size_t e=bits/8+12,at=bits/8+4;auto* x=static_cast<unsigned char*>(X);
+    impl->pool_workers();
+    parallel(impl->threads(),cols?rows:0,[&](std::size_t i0,std::size_t i1){for(std::size_t i=i0;i<i1;++i)for(std::size_t j=0;j<cols;++j){
+        unsigned char* p=x+(i*ldx+j)*e+at;int sign;std::memcpy(&sign,p,4);sign=-sign;std::memcpy(p,&sign,4);}});
+}
+void Linalg::copy_block(int bits,const void* X,std::size_t ldx,void* Y,std::size_t ldy,std::size_t rows,std::size_t cols,bool transpose,bool negate){
+    check_bits(bits);check_block("copy_block",X,transpose?cols:rows,transpose?rows:cols,ldx);check_block("copy_block",Y,rows,cols,ldy);
+    const std::size_t e=bits/8+12,at=bits/8+4;const auto* x=static_cast<const unsigned char*>(X);auto* y=static_cast<unsigned char*>(Y);
+    // Transposes run over 32 x 32 tiles of Y.
+    const std::size_t tile=transpose?32:1,tiles=(rows+tile-1)/tile;impl->pool_workers();
+    parallel(impl->threads(),cols?tiles:0,[&](std::size_t t0,std::size_t t1){for(std::size_t i0=t0*tile;i0<std::min(rows,t1*tile);i0+=tile){
+        const std::size_t i1=std::min(rows,i0+tile);
+        if(!transpose)for(std::size_t i=i0;i<i1;++i)std::memcpy(y+i*ldy*e,x+i*ldx*e,cols*e);
+        else for(std::size_t j0=0;j0<cols;j0+=32)for(std::size_t j=j0;j<std::min(cols,j0+32);++j)for(std::size_t i=i0;i<i1;++i)std::memcpy(y+(i*ldy+j)*e,x+(j*ldx+i)*e,e);
+        if(negate)for(std::size_t i=i0;i<i1;++i)for(std::size_t j=0;j<cols;++j){unsigned char* p=y+(i*ldy+j)*e+at;int sign;std::memcpy(&sign,p,4);sign=-sign;std::memcpy(p,&sign,4);}}});
+}
+void Linalg::axpy_block(int bits,const void* alpha,const void* X,std::size_t ldx,void* Y,std::size_t ldy,std::size_t rows,std::size_t cols){
+    check_bits(bits);check_block("axpy_block",X,rows,cols,ldx);check_block("axpy_block",Y,rows,cols,ldy);if(rows&&cols&&!alpha)throw std::invalid_argument("axpy_block: null alpha");
+    const std::size_t e=bits/8+12;const auto* x=static_cast<const unsigned char*>(X);auto* y=static_cast<unsigned char*>(Y);DotFn dot=dot_function(bits/32);
+    impl->pool_workers();
+    parallel(impl->threads(),cols?rows:0,[&](std::size_t i0,std::size_t i1){for(std::size_t i=i0;i<i1;++i)for(std::size_t j=0;j<cols;++j)
+        dot(alpha,0,x+(i*ldx+j)*e,0,1,y+(i*ldy+j)*e,2);});
+}
+Timing Linalg::Impl::run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,std::size_t K,void* C,bool syrk,bool lower_only,bool sub_only,std::size_t stride,bool require_gpu,
+                         bool add,int tri){@autoreleasepool{
+    const bool sub=sub_only||add;const int mode=add?2:sub?1:0;if(syrk)tri=1; // sub: an update (reads the old C); SYRK assembles the lower triangle, then mirrors
     auto start=Clock::now();report=LinalgReport{};report.m=M;report.n=Nc;report.k=K;if(!stride)stride=Nc;pool_workers();
     const std::size_t limit=std::size_t(1)<<31;if(M>=limit||Nc>=limit||K>=limit||M*stride>=limit)throw std::invalid_argument("matrix dimensions exceed 32-bit indexing");
     if(M&&Nc&&!C)throw std::invalid_argument("null output");if(M*Nc&&K&&(!lv.base||!rv.base))throw std::invalid_argument("null input");
@@ -323,15 +401,24 @@ Timing Linalg::Impl::run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,s
             std::to_string(ls.fallback)+"/"+std::to_string(rs.fallback)+", max_bands="+std::to_string(options.max_bands)+", max_spread="+std::to_string(options.max_spread)+
             (force?" (forced fallback or K exceeds 65472)":" (exponent-band limits)"));
     }
-    Timing timing{0,0};id<MTLBuffer> out=nil;std::size_t out_offset=0;
+    Timing timing{0,0};id<MTLBuffer> out=nil;std::size_t out_offset=0,ostride=Nc;
     if(!ls.band.empty()&&!rs.band.empty()){
         Kernels& kern=get(bits);t=Clock::now();
         // Inputs (one copy for SYRK), band members (segments aligned to 64 members), line tables, output, accumulators.
         // Resident (factorization) operands are strided views of a larger buffer; public operands are contiguous.
-        std::size_t a_offset=0,b_offset=0;id<MTLBuffer> in_a=find(lv.base,a_offset),in_b=nil;
-        if(!in_a&&!(in_a=wrap(lv.base,M*K*eb))){in_a=buffer("a",M*K*eb);std::memcpy(in_a.contents,lv.base,M*K*eb);}
-        if(syrk){in_b=in_a;b_offset=a_offset;}
-        else if(!(in_b=find(rv.base,b_offset))&&!(in_b=wrap(rv.base,K*Nc*eb))){in_b=buffer("b",K*Nc*eb);std::memcpy(in_b.contents,rv.base,K*Nc*eb);}
+        // Other host views (strided GEMM operands) are packed into scratch, keeping the contiguous index contiguous.
+        auto stage=[&](View& v,std::size_t lines,const char* role,std::size_t& offset)->id<MTLBuffer>{
+            if(id<MTLBuffer> b=find(v.base,offset))return b;offset=0;const std::size_t bytes=lines*K*eb;
+            if((v.k_stride==1&&v.line_stride==K)||(v.line_stride==1&&v.k_stride==lines)){if(id<MTLBuffer> b=wrap(v.base,bytes))return b;
+                id<MTLBuffer> b=buffer(role,bytes);std::memcpy(b.contents,v.base,bytes);return b;}
+            id<MTLBuffer> b=buffer(role,bytes);auto* d=static_cast<unsigned char*>(b.contents);const View src=v;
+            if(src.line_stride==1&&src.k_stride!=1){v.line_stride=1;v.k_stride=lines;
+                parallel(nt,K,[&](std::size_t k0,std::size_t k1){for(std::size_t k=k0;k<k1;++k)std::memcpy(d+k*lines*eb,src.at(0,k),lines*eb);});}
+            else{v.line_stride=K;v.k_stride=1;parallel(nt,lines,[&](std::size_t l0,std::size_t l1){for(std::size_t i=l0;i<l1;++i){
+                if(src.k_stride==1)std::memcpy(d+i*K*eb,src.at(i,0),K*eb);else for(std::size_t k=0;k<K;++k)std::memcpy(d+(i*K+k)*eb,src.at(i,k),eb);}});}
+            v.base=d;return b;};
+        View gl=lv,gr=rv;std::size_t a_offset=0,b_offset=0;id<MTLBuffer> in_a=stage(gl,M,"a",a_offset),in_b=nil;
+        if(syrk){in_b=in_a;b_offset=a_offset;gr=gl;}else in_b=stage(gr,Nc,"b",b_offset);
         // Extended operands: all bands of a side concatenated (band b of the left starts at row loff[b]); one integer GEMM per
         // modulus then holds every band pair as a sub-block. SYRK shares one extended operand.
         std::vector<Member> members;std::vector<std::size_t> loff,roff;
@@ -342,10 +429,10 @@ Timing Linalg::Impl::run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,s
         id<MTLBuffer> mem=buffer("members",members.size()*sizeof(Member));std::memcpy(mem.contents,members.data(),members.size()*sizeof(Member));
         id<MTLBuffer> lline=buffer("lline",M*sizeof(Line)),rline=lline;std::memcpy(lline.contents,ls.line.data(),M*sizeof(Line));
         if(!syrk){rline=buffer("rline",Nc*sizeof(Line));std::memcpy(rline.contents,rs.line.data(),Nc*sizeof(Line));}
-        // An update reads the old C on the GPU: a copied output starts as a copy of C.
-        if((out=find(C,out_offset))||(stride==Nc&&(out=wrap(C,M*Nc*eb))))report.zero_copy_output=true;
-        else if(stride!=Nc)throw std::logic_error("linalg: strided output outside a resident buffer");
-        else{out=buffer("out",M*Nc*eb);if(sub)std::memcpy(out.contents,C,M*Nc*eb);}
+        // An update reads the old C on the GPU: a copied output (row stride Nc) starts as a copy of C.
+        if((out=find(C,out_offset))||(out=wrap(C,((M-1)*stride+Nc)*eb))){report.zero_copy_output=true;ostride=stride;}
+        else{out=buffer("out",M*Nc*eb);if(sub){auto* d=static_cast<unsigned char*>(out.contents);const auto* s=static_cast<const unsigned char*>(C);
+            parallel(nt,M,[&](std::size_t i0,std::size_t i1){for(std::size_t i=i0;i<i1;++i)std::memcpy(d+i*Nc*eb,s+i*stride*eb,Nc*eb);});}}
         std::size_t slots=ls.multi*Nc+ls.single*rs.multi;id<MTLBuffer> acc=buffer("acc",slots*kern.acc_words*4);
         // Moduli for |sum| < K * 2^(Pb+Pc) over all pairs, P = bits + widest band. SYRK reconstructs pairs b >= c only:
         // an off-diagonal pair also supplies the transposed (c, b) terms (fold).
@@ -373,8 +460,8 @@ Timing Linalg::Impl::run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,s
         auto grid=[&](id<MTLComputePipelineState> p,std::size_t w,std::size_t h,std::size_t d=1){if(!w||!h||!d)return;[enc setComputePipelineState:p];
             [enc dispatchThreads:MTLSizeMake(w,h,d) threadsPerThreadgroup:MTLSizeMake(32,std::min<NSUInteger>(8,p.maxTotalThreadsPerThreadgroup/32),1)];};
         Params p{};p.rows=std::uint32_t(Me);p.cols=std::uint32_t(Ne);p.K=std::uint32_t(K);p.Kp=std::uint32_t(Kp);p.Mp=std::uint32_t(Mp);p.Np=std::uint32_t(Np);
-        p.L=L;p.Wc=Wc;p.tri=syrk;p.lower=syrk;p.both=syrk;p.ls_line=std::uint32_t(lv.line_stride);p.ls_k=std::uint32_t(lv.k_stride);
-        p.rs_line=std::uint32_t(rv.line_stride);p.rs_k=std::uint32_t(rv.k_stride);p.out_cols=std::uint32_t(Nc);p.multi_rows=std::uint32_t(ls.multi);p.multi_cols=std::uint32_t(rs.multi);p.out_stride=std::uint32_t(stride);
+        p.L=L;p.Wc=Wc;p.tri=syrk;p.lower=syrk?1:std::uint32_t(tri);p.both=syrk;p.add=add;p.ls_line=std::uint32_t(gl.line_stride);p.ls_k=std::uint32_t(gl.k_stride);
+        p.rs_line=std::uint32_t(gr.line_stride);p.rs_k=std::uint32_t(gr.k_stride);p.out_cols=std::uint32_t(Nc);p.multi_rows=std::uint32_t(ls.multi);p.multi_cols=std::uint32_t(rs.multi);p.out_stride=std::uint32_t(ostride);
         const std::uint32_t st[4]={std::uint32_t(2*hp),std::uint32_t(hp),std::uint32_t(rp),0};
         for(unsigned j0=0;j0<L;j0+=B){
             // Digits of the extended operands for moduli j0 .. j0+count-1 (grid z: groups of `group` moduli), then the residues.
@@ -402,13 +489,13 @@ Timing Linalg::Impl::run(int bits,View lv,View rv,std::size_t M,std::size_t Nc,s
     t=Clock::now();std::atomic<std::size_t> next{0},gpu_count{0},multi_count{0},fallback_count{0},trivial_count{0};std::atomic<double> fallback_time{0};
     const unsigned char* o=out?static_cast<const unsigned char*>(out.contents)+out_offset:nullptr;auto* c=static_cast<unsigned char*>(C);DotFn dot=dot_function(N);
     auto worker=[&](std::size_t,std::size_t){std::size_t g=0,mu=0,fb=0,tr=0;double ft=0;
-        for(std::size_t i;(i=next.fetch_add(1))<M;)for(std::size_t j=0;j<(syrk?i+1:Nc);++j){
+        for(std::size_t i;(i=next.fetch_add(1))<M;)for(std::size_t j=tri==2?i:0;j<(tri==1?i+1:Nc);++j){
             unsigned char* dst=c+(i*stride+j)*eb;std::uint8_t ci=ls.cls[i],cj=rs.cls[j];
             // A zero line leaves an update unchanged; a status line gives zero with the statuses (and the old entry's).
             if(ci==1||cj==1){word st=ls.status[i]|rs.status[j],old=0;std::memcpy(&old,dst+4*N+8,4);if(sub)st|=old;
                 if(!sub||st){std::memset(dst,0,eb);std::memcpy(dst+4*N+8,&st,4);}++tr;}
-            else if(ci==2||cj==2){auto f=Clock::now();dot(lv.at(i,0),std::ptrdiff_t(lv.k_stride),rv.at(j,0),std::ptrdiff_t(rv.k_stride),K,dst,sub);ft+=since(f);++fb;}
-            else{if(o!=c)std::memcpy(dst,o+(i*stride+j)*eb,eb);++g;mu+=ls.line[i].bands>1||rs.line[j].bands>1;}
+            else if(ci==2||cj==2){auto f=Clock::now();dot(lv.at(i,0),std::ptrdiff_t(lv.k_stride),rv.at(j,0),std::ptrdiff_t(rv.k_stride),K,dst,mode);ft+=since(f);++fb;}
+            else{const unsigned char* src=o+(i*ostride+j)*eb;if(src!=dst)std::memcpy(dst,src,eb);++g;mu+=ls.line[i].bands>1||rs.line[j].bands>1;}
         }
         gpu_count+=g;multi_count+=mu;fallback_count+=fb;trivial_count+=tr;double old=fallback_time.load();while(!fallback_time.compare_exchange_weak(old,old+ft)){}};
     parallel(nt,nt,worker);
@@ -902,15 +989,24 @@ template<class I> struct Claim {
 };
 }
 LinalgTicket Linalg::encode_product(CommandBatch& batch,int bits,bool syrk,bool ta,const detail::Operand& A,const detail::Operand& B,std::size_t M,std::size_t Nc,
-                                    std::size_t K,const detail::Operand& C,bool lower_only,bool sub){@autoreleasepool{
+                                    std::size_t K,const detail::Operand& C,bool lower_only,bool sub,const GemmSpec* spec){@autoreleasepool{
     using detail::Internal;check_bits(bits);
+    if(spec&&spec->require_gpu)throw std::invalid_argument("resident gemm: require_gpu is not supported (host fallback is decided inside the batch)");
+    // Views: SYRK lines are columns of A (K x M); GEMM lines are rows of op(A) and columns of op(B) (gemm_views; the plain form
+    // is a packed GemmSpec). Offsets and the row stride of C address submatrices of the buffers.
+    GemmSpec gs;if(spec)gs=*spec;else{gs.transpose_a=ta;gs.update=sub?GemmUpdate::subtract:GemmUpdate::overwrite;}
+    const bool add=!syrk&&gs.update==GemmUpdate::add;const int tri=syrk?1:triangle_code(gs.triangle),mode=add?2:sub?1:0;
+    const GemmViews gv=syrk?GemmViews{Nc,1,M,1,M}:gemm_views(gs,M,Nc,K,"gemm");
+    const std::size_t ls_line=gv.ls_line,ls_k=gv.ls_k,rs_line=gv.rs_line,rs_k=gv.rs_k,ldc=gv.ldc,a_span=view_extent(M,K,ls_line,ls_k),b_span=syrk?0:view_extent(Nc,K,rs_line,rs_k);
     if(Internal::device(batch)!=impl->device)throw std::invalid_argument("Linalg and batch use different Metal devices (construct the Linalg from the batch's Engine)");
     if(syrk&&sub&&!lower_only)throw std::invalid_argument("syrk: subtract updates the lower triangle only (lower_only)");
     const std::size_t limit=std::size_t(1)<<31;
     if(M>=limit||Nc>=limit||K>=limit||M*Nc>=limit||M*K>=limit||K*Nc>=limit)throw std::invalid_argument("matrix dimensions exceed 32-bit indexing");
     auto need=[](const detail::Operand& b,std::size_t n,const char* what){if(!n)return;if(!b.storage)throw std::invalid_argument(std::string(what)+": missing buffer");
         if(b.size<n)throw std::invalid_argument(std::string(what)+": buffer too small");};
-    need(A,M*K,syrk?"syrk A":"gemm A");if(!syrk)need(B,K*Nc,"gemm B");need(C,M*Nc,syrk?"syrk C":"gemm C");
+    if(a_span>=limit||b_span>=limit||(M&&Nc&&(M-1)*ldc+Nc>=limit))throw std::invalid_argument("matrix dimensions exceed 32-bit indexing");
+    need(A,a_span?gs.a_offset+a_span:0,syrk?"syrk A":"gemm A");if(!syrk)need(B,b_span?gs.b_offset+b_span:0,"gemm B");
+    need(C,M&&Nc?gs.c_offset+(M-1)*ldc+Nc:0,syrk?"syrk C":"gemm C");
     if(C.storage&&(C.storage==A.storage||C.storage==B.storage))throw std::invalid_argument("resident product: C must not be A or B");
     const LinalgOptions& o=impl->options;
     if(o.resident_bands<1)throw std::invalid_argument("resident products: resident_bands >= 1");
@@ -928,7 +1024,7 @@ LinalgTicket Linalg::encode_product(CommandBatch& batch,int bits,bool syrk,bool 
     const std::size_t Kp=up(std::max<std::size_t>(K,1),64),Mpc=up(me_cap,64),Npc=syrk?Mpc:up(ne_cap,64),hp=Mpc*Kp,rp=2*Kp*Npc;
     const unsigned Lmax=force?0:mt.max_moduli;unsigned Bm=0,batches=0;
     if(Lmax){Bm=std::min<unsigned>(Lmax,std::max<unsigned>(group,unsigned(std::min<std::size_t>(plane_budget()/(4*hp+rp),1u<<20))/group*group));batches=(Lmax+Bm-1)/Bm;}
-    const std::size_t acc_bytes=Lmax&&R>1?M*Nc*std::size_t(kern.acc_words)*4:0,res_bytes=std::size_t(Lmax)*Mpc*Npc*2,copy_a=M*K*eb/4,copy_b=syrk?0:K*Nc*eb/4;
+    const std::size_t acc_bytes=Lmax&&R>1?M*Nc*std::size_t(kern.acc_words)*4:0,res_bytes=std::size_t(Lmax)*Mpc*Npc*2,copy_a=a_span*eb/4,copy_b=b_span*eb/4;
     if(acc_bytes/4>=(std::size_t(1)<<32)||copy_a>=(std::size_t(1)<<32)||copy_b>=(std::size_t(1)<<32))throw std::invalid_argument("resident product: workspace exceeds 32-bit indexing");
     for(std::size_t bytes:{acc_bytes,res_bytes,std::size_t(Bm)*2*hp,std::size_t(Bm)*rp,copy_a*4})
         if(bytes>impl->device.maxBufferLength)throw std::invalid_argument("resident product: workspace exceeds the device buffer limit (lower resident_bands)");
@@ -940,8 +1036,6 @@ LinalgTicket Linalg::encode_product(CommandBatch& batch,int bits,bool syrk,bool 
         auto found=impl->by_batch.find(key);if(found!=impl->by_batch.end())shared=found->second.lock();
         if(!shared){shared=Impl::free_space(impl->batch_spaces);impl->by_batch[key]=shared;}}
     id<MTLDevice> dev=impl->device;
-    // Views: SYRK lines are columns of A (K x M); GEMM rows of A (M x K) or columns of A (K x M, transposed), and columns of B (K x Nc).
-    const std::size_t ls_line=syrk||ta?1:K,ls_k=syrk||ta?M:1,rs_line=1,rs_k=syrk?M:Nc;
     id<MTLBuffer> linfo=call->get(dev,"linfo",M*16),lbands=call->get(dev,"lbands",M*std::size_t(R)*8),lmem=call->get(dev,"lmem",me_cap*12),lline=call->get(dev,"lline",M*12),lsum=call->get(dev,"lsum",std::size_t(R+4)*4);
     id<MTLBuffer> rinfo=linfo,rbands=lbands,rmem=lmem,rline=lline,rsum=lsum;
     if(!syrk){rinfo=call->get(dev,"rinfo",Nc*16);rbands=call->get(dev,"rbands",Nc*std::size_t(R)*8);rmem=call->get(dev,"rmem",ne_cap*12);rline=call->get(dev,"rline",Nc*12);rsum=call->get(dev,"rsum",std::size_t(R+4)*4);}
@@ -953,10 +1047,11 @@ LinalgTicket Linalg::encode_product(CommandBatch& batch,int bits,bool syrk,bool 
         rcat=shared->get(dev,"rcat",std::size_t(Bm)*rp);res=shared->get(dev,"res",res_bytes);if(acc_bytes)acc=shared->get(dev,"acc",acc_bytes);}
     // With K = 0 the operands are never read; a buffer of one element stands in (binding sizes are validated by the debug layer).
     id<MTLBuffer> out=C.storage->buffer,abuf=K?A.storage->buffer:call->get(dev,"none",eb),bbuf=syrk?abuf:K?B.storage->buffer:abuf;
+    const NSUInteger aoff=K?gs.a_offset*eb:0,boff=syrk?aoff:K?gs.b_offset*eb:0,coff=gs.c_offset*eb;
     auto rec_p=sub?kern.reconstruct_sub:kern.reconstruct,fin_p=sub?kern.finish_sub:kern.finish;
     auto height=[](id<MTLComputePipelineState> p){return std::min<NSUInteger>(8,p.maxTotalThreadsPerThreadgroup/32);};
-    Params base{};base.K=std::uint32_t(K);base.Kp=std::uint32_t(Kp);base.tri=syrk;base.lower=syrk;base.both=syrk;
-    base.ls_line=std::uint32_t(ls_line);base.ls_k=std::uint32_t(ls_k);base.rs_line=std::uint32_t(rs_line);base.rs_k=std::uint32_t(rs_k);base.out_cols=std::uint32_t(Nc);base.out_stride=std::uint32_t(Nc);
+    Params base{};base.K=std::uint32_t(K);base.Kp=std::uint32_t(Kp);base.tri=syrk;base.lower=std::uint32_t(tri);base.both=syrk;base.add=add;
+    base.ls_line=std::uint32_t(ls_line);base.ls_k=std::uint32_t(ls_k);base.rs_line=std::uint32_t(rs_line);base.rs_k=std::uint32_t(rs_k);base.out_cols=std::uint32_t(Nc);base.out_stride=std::uint32_t(ldc);
     PlanConst pc{base,std::uint32_t(M),std::uint32_t(Nc),std::uint32_t(R),syrk,std::uint32_t(me_cap),std::uint32_t(ne_cap),Bm,batches,std::uint32_t(kern.acc_words),
                  std::uint32_t(copy_a),std::uint32_t(copy_b),std::uint32_t(height(kern.left)),std::uint32_t(height(kern.right)),std::uint32_t(height(rec_p)),std::uint32_t(height(fin_p))};
     // C is final at wait: outputs of host-fallback lines are computed then (from the snapshots of A and B taken in the batch).
@@ -977,9 +1072,9 @@ LinalgTicket Linalg::encode_product(CommandBatch& batch,int bits,bool syrk,bool 
             for(unsigned b=0;b<lc.size();++b)for(unsigned c=0;c<(syrk?b+1:rc.size());++c)r.pairs.push_back({b,c,unsigned(lc[b]),unsigned(rc[c]),h[2]});}
         if(any){auto t=Clock::now();DotFn dot=dot_function(N);auto* c=static_cast<unsigned char*>(O->buffer.contents);
             const View lv{static_cast<const unsigned char*>(snap_a.contents),eb,ls_line,ls_k,N},rv{static_cast<const unsigned char*>(snap_b.contents),eb,rs_line,rs_k,N};
-            host_items(threads,M,[&](std::size_t i){for(std::size_t j=0;j<(syrk?i+1:Nc);++j){const LineInfo &x=li[i],&y=ri[j];
-                if(x.cls==1||y.cls==1||!(overflow||x.cls==2||y.cls==2))continue;unsigned char* dst=c+(i*Nc+j)*eb;
-                dot(lv.at(i,0),std::ptrdiff_t(lv.k_stride),rv.at(j,0),std::ptrdiff_t(rv.k_stride),K,dst,sub);
+            host_items(threads,M,[&](std::size_t i){for(std::size_t j=tri==2?i:0;j<(tri==1?i+1:Nc);++j){const LineInfo &x=li[i],&y=ri[j];
+                if(x.cls==1||y.cls==1||!(overflow||x.cls==2||y.cls==2))continue;unsigned char* dst=c+coff+(i*ldc+j)*eb;
+                dot(lv.at(i,0),std::ptrdiff_t(lv.k_stride),rv.at(j,0),std::ptrdiff_t(rv.k_stride),K,dst,mode);
                 if(syrk&&!lower_only&&j<i)std::memcpy(c+(j*Nc+i)*eb,dst,eb);}});
             r.fallback_seconds=since(t);}
         pass->provisional_reads=flag->load();pass->done.store(true,std::memory_order_release);});
@@ -989,10 +1084,10 @@ LinalgTicket Linalg::encode_product(CommandBatch& batch,int bits,bool syrk,bool 
     const NSUInteger arg0=4*64*NSUInteger(3+batches+pairs);auto arg=[&](unsigned i){return arg0+16*NSUInteger(i);};auto rec=[](unsigned i){return NSUInteger(4*64*i);};
     auto indirect=[&](id<MTLComputeCommandEncoder> e,unsigned a,MTLSize tg){[e dispatchThreadgroupsWithIndirectBuffer:plan indirectBufferOffset:arg(a) threadsPerThreadgroup:tg];};
     auto tile=[&](id<MTLComputePipelineState> p){return MTLSizeMake(32,height(p),1);};
-    auto analyze=[&](id<MTLBuffer> src,std::size_t lines,std::size_t line_stride,std::size_t k_stride,id<MTLBuffer> info,id<MTLBuffer> bands){
+    auto analyze=[&](id<MTLBuffer> src,NSUInteger offset,std::size_t lines,std::size_t line_stride,std::size_t k_stride,id<MTLBuffer> info,id<MTLBuffer> bands){
         struct {std::uint32_t lines,K,line_stride,k_stride,R,force;std::int32_t G,max_bands,max_spread;} sp{std::uint32_t(lines),std::uint32_t(K),std::uint32_t(line_stride),
             std::uint32_t(k_stride),std::uint32_t(R),force,o.band_bits,o.max_bands,o.max_spread};
-        auto e=start(kern.analyze);[e setBuffer:src offset:0 atIndex:0];[e setBuffer:info offset:0 atIndex:1];[e setBuffer:bands offset:0 atIndex:2];[e setBytes:&sp length:sizeof sp atIndex:3];
+        auto e=start(kern.analyze);[e setBuffer:src offset:offset atIndex:0];[e setBuffer:info offset:0 atIndex:1];[e setBuffer:bands offset:0 atIndex:2];[e setBytes:&sp length:sizeof sp atIndex:3];
         if(kern.analyze.threadExecutionWidth!=32||kern.analyze.maxTotalThreadsPerThreadgroup<64)throw std::runtime_error("linalg: analysis needs 32-lane SIMD groups");
         [e dispatchThreadgroups:MTLSizeMake((lines+1)/2,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];}; // one SIMD group per line, whole groups
     auto side=[&](std::size_t lines,std::size_t cap,id<MTLBuffer> info,id<MTLBuffer> bands,id<MTLBuffer> mem,id<MTLBuffer> line,id<MTLBuffer> sum){
@@ -1000,24 +1095,24 @@ LinalgTicket Linalg::encode_product(CommandBatch& batch,int bits,bool syrk,bool 
         auto e=start(kern.plan_side);[e setBuffer:info offset:0 atIndex:0];[e setBuffer:bands offset:0 atIndex:1];[e setBuffer:mem offset:0 atIndex:2];
         [e setBuffer:line offset:0 atIndex:3];[e setBuffer:sum offset:0 atIndex:4];[e setBytes:sp length:sizeof sp atIndex:5];
         [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(T,1,1)];};
-    analyze(abuf,M,ls_line,ls_k,linfo,lbands);if(!syrk)analyze(bbuf,Nc,rs_line,rs_k,rinfo,rbands);
+    analyze(abuf,aoff,M,ls_line,ls_k,linfo,lbands);if(!syrk)analyze(bbuf,boff,Nc,rs_line,rs_k,rinfo,rbands);
     side(M,me_cap,linfo,lbands,lmem,lline,lsum);if(!syrk)side(Nc,ne_cap,rinfo,rbands,rmem,rline,rsum);
     {auto e=start(kern.plan_final);[e setBuffer:lsum offset:0 atIndex:0];[e setBuffer:rsum offset:0 atIndex:1];[e setBuffer:plan offset:0 atIndex:2];
         [e setBuffer:mt.table offset:0 atIndex:3];[e setBuffer:mt.bounds offset:0 atIndex:4];[e setBuffer:bnd offset:0 atIndex:5];[e setBytes:&pc length:sizeof pc atIndex:6];
         [e dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];}
     // Snapshots of the operands for the host fallback (no work unless the plan found fallback lines or an overflow).
-    auto snapshot=[&](id<MTLBuffer> src,id<MTLBuffer> dst,std::size_t words,unsigned a){if(!words)return;const std::uint32_t w=std::uint32_t(words);
-        auto e=start(kern.copy);[e setBuffer:src offset:0 atIndex:0];[e setBuffer:dst offset:0 atIndex:1];[e setBytes:&w length:4 atIndex:2];indirect(e,a,MTLSizeMake(256,1,1));};
-    snapshot(abuf,snap_a,copy_a,1);if(!syrk)snapshot(bbuf,snap_b,copy_b,2);
+    auto snapshot=[&](id<MTLBuffer> src,NSUInteger offset,id<MTLBuffer> dst,std::size_t words,unsigned a){if(!words)return;const std::uint32_t w=std::uint32_t(words);
+        auto e=start(kern.copy);[e setBuffer:src offset:offset atIndex:0];[e setBuffer:dst offset:0 atIndex:1];[e setBytes:&w length:4 atIndex:2];indirect(e,a,MTLSizeMake(256,1,1));};
+    snapshot(abuf,aoff,snap_a,copy_a,1);if(!syrk)snapshot(bbuf,boff,snap_b,copy_b,2);
     if(Lmax){
         if(acc){const std::uint32_t aw=std::uint32_t(kern.acc_words);auto e=start(kern.clear);[e setBuffer:acc offset:0 atIndex:0];[e setBuffer:plan offset:0 atIndex:1];
             [e setBytes:&aw length:4 atIndex:2];indirect(e,0,MTLSizeMake(256,1,1));}
         auto common=[&](id<MTLComputeCommandEncoder> e){[e setBuffer:kern.moduli offset:0 atIndex:11];[e setBuffer:kern.recips offset:0 atIndex:12];};
         for(unsigned t=0;t<batches;++t){
-            {auto e=start(kern.left);common(e);[e setBuffer:abuf offset:0 atIndex:0];[e setBuffer:lmem offset:0 atIndex:1];[e setBuffer:lcat offset:0 atIndex:2];
+            {auto e=start(kern.left);common(e);[e setBuffer:abuf offset:aoff atIndex:0];[e setBuffer:lmem offset:0 atIndex:1];[e setBuffer:lcat offset:0 atIndex:2];
                 [e setBuffer:a1 offset:0 atIndex:3];[e setBuffer:a0 offset:0 atIndex:4];[e setBuffer:plan offset:rec(2+t) atIndex:5];[e setBuffer:rcat offset:0 atIndex:6];
                 indirect(e,4+3*t,tile(kern.left));}
-            if(!syrk){auto e=start(kern.right);common(e);[e setBuffer:bbuf offset:0 atIndex:0];[e setBuffer:rmem offset:0 atIndex:1];[e setBuffer:rcat offset:0 atIndex:2];
+            if(!syrk){auto e=start(kern.right);common(e);[e setBuffer:bbuf offset:boff atIndex:0];[e setBuffer:rmem offset:0 atIndex:1];[e setBuffer:rcat offset:0 atIndex:2];
                 [e setBuffer:plan offset:rec(2+t) atIndex:5];indirect(e,5+3*t,tile(kern.right));}
             {auto e=start(kern.product_res);common(e);[e setBuffer:lcat offset:0 atIndex:0];[e setBuffer:a1 offset:0 atIndex:1];[e setBuffer:a0 offset:0 atIndex:2];
                 [e setBuffer:rcat offset:0 atIndex:3];[e setBuffer:res offset:0 atIndex:4];[e setBuffer:plan offset:rec(2+t) atIndex:5];[e setBuffer:plan offset:rec(2+batches+pairs) atIndex:6];
@@ -1026,12 +1121,12 @@ LinalgTicket Linalg::encode_product(CommandBatch& batch,int bits,bool syrk,bool 
         for(unsigned q=0;q<pairs;++q){auto e=start(rec_p);common(e);
             [e setBuffer:res offset:0 atIndex:0];[e setBuffer:kern.inv offset:0 atIndex:2];[e setBuffer:bnd offset:0 atIndex:3];[e setBuffer:lmem offset:0 atIndex:4];
             [e setBuffer:plan offset:rec(2+batches+q) atIndex:5];[e setBuffer:rmem offset:0 atIndex:6];[e setBuffer:lline offset:0 atIndex:7];[e setBuffer:rline offset:0 atIndex:8];
-            [e setBuffer:out offset:0 atIndex:9];[e setBuffer:acc?acc:lline offset:0 atIndex:10];indirect(e,4+3*batches+q,tile(rec_p));}
+            [e setBuffer:out offset:coff atIndex:9];[e setBuffer:acc?acc:lline offset:0 atIndex:10];indirect(e,4+3*batches+q,tile(rec_p));}
         if(acc){auto e=start(fin_p);[e setBuffer:plan offset:rec(1) atIndex:5];[e setBuffer:lline offset:0 atIndex:7];[e setBuffer:rline offset:0 atIndex:8];
-            [e setBuffer:out offset:0 atIndex:9];[e setBuffer:acc offset:0 atIndex:10];indirect(e,3,tile(fin_p));}
+            [e setBuffer:out offset:coff atIndex:9];[e setBuffer:acc offset:0 atIndex:10];indirect(e,3,tile(fin_p));}
     }
-    {const std::uint32_t tp[4]={std::uint32_t(M),std::uint32_t(Nc),syrk,sub};auto e=start(kern.trivial);[e setBuffer:linfo offset:0 atIndex:0];[e setBuffer:rinfo offset:0 atIndex:1];
-        [e setBuffer:out offset:0 atIndex:2];[e setBytes:tp length:sizeof tp atIndex:3];[e dispatchThreads:MTLSizeMake(Nc,M,1) threadsPerThreadgroup:tile(kern.trivial)];}
+    {const std::uint32_t tp[5]={std::uint32_t(M),std::uint32_t(Nc),std::uint32_t(tri),sub,std::uint32_t(ldc)};auto e=start(kern.trivial);[e setBuffer:linfo offset:0 atIndex:0];[e setBuffer:rinfo offset:0 atIndex:1];
+        [e setBuffer:out offset:coff atIndex:2];[e setBytes:tp length:sizeof tp atIndex:3];[e dispatchThreads:MTLSizeMake(Nc,M,1) threadsPerThreadgroup:tile(kern.trivial)];}
     if(syrk&&!lower_only){const std::uint32_t n32=std::uint32_t(Nc);auto e=start(kern.mirror);[e setBuffer:out offset:0 atIndex:0];[e setBytes:&n32 length:4 atIndex:1];
         [e dispatchThreads:MTLSizeMake(Nc,M,1) threadsPerThreadgroup:tile(kern.mirror)];}
     return LinalgTicket(pass);

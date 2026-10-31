@@ -612,6 +612,64 @@ host-array forms make for arrays that are not page aligned), and the results equ
 calls bit for bit. L may be A and X may be B (in place); X must not be L, and a QR solution must not
 be B. A `QRFactor` made from a buffer owns copies as before (`factor_qr` only reads A).
 
+### Strided, signed and triangular products
+
+`Linalg::gemm` with a `GemmSpec` (unreleased; `LIMBFORGE_GEMM_SPEC_API`) generalizes the plain product
+for blocked and recursive factorizations without consumer-side extract/insert copies:
+
+```cpp
+GemmSpec s;
+s.transpose_a = false; s.transpose_b = true;     // op(B) = B^T, B stored n x k
+s.lda = ld; s.ldb = ld; s.ldc = ld;              // row strides of the stored matrices (0 = packed)
+s.a_offset = r0*ld + c0;                         // first element of each view (elements)
+s.update = GemmUpdate::add;                      // overwrite | add | subtract
+s.triangle = Triangle::lower;                    // full | lower | upper (m == n)
+la.gemm(bits, A, B, m, n, k, C, s);              // C = RN(C + op(A) op(B)), lower triangle only
+la.syr2k(bits, A, B, n, k, C, /*skew=*/true, s); // C = RN(C + (A^T B - B^T A)), one rounding per entry
+la.gemm(batch, Ab, Bb, m, n, k, Cb, s);          // resident Buffer form, same views
+```
+
+**Contract.** Each written output is one rounding of its exact dot product, as in the plain GEMM:
+`overwrite` gives `RN(op(A) op(B))`, `add` gives `RN(C + op(A) op(B))` and `subtract` gives
+`RN(C - op(A) op(B))`. The status, empty-K and zero-line rules are the same as for the plain
+product and update. A default `GemmSpec` reproduces `gemm(bits, false, A, B, m, n, k, C)` bit for
+bit. Existing entry points and defaults are unchanged.
+
+- **Views.** `lda`, `ldb` and `ldc` are row strides of the stored row-major matrices. They must be at
+  least the stored column count and below 2^31. Offsets address a submatrix from the host pointer
+  or the buffer start. Host operands not already resident are packed once into scratch
+  (multithreaded, O(mk + kn)). A strided C is written in place when page aligned; otherwise only
+  the written entries are copied back. C must not overlap A or B.
+- **Triangles.** With `Triangle::lower` or `Triangle::upper` (square C), only outputs with
+  `i >= j` or `i <= j` are computed and written. The rest of C, and every entry outside the view,
+  keeps its bits. The GPU skips reconstruction and host assembly of the other triangle. The int8
+  residue products still cover the full extended product, so GPU time does not halve.
+- **`syr2k`.** For A and B (k x n), `syr2k` forms `A^T B + B^T A` (symmetric) or `A^T B - B^T A`
+  (skew). With `transpose_a` it forms `A B^T ± B A^T` for A and B (n x k). It packs `[A; B]` and
+  `[B; ±A]` once (O(nk)) and takes the exact 2k-term dot of each entry, so the update has one
+  rounding, not two. Entry (i, j) carries the statuses of lines i and j of both operands. Skew
+  results have an exactly zero diagonal contribution: an `add` or `subtract` leaves `C[i][i]`
+  unchanged unless a status propagates.
+- **GPU requirement.** `require_gpu` applies `gemm_gpu`'s rule to host arrays: host fallback throws
+  after analysis and before C changes. The Buffer form rejects it with `invalid_argument`, because
+  resident fallback is decided inside the batch.
+- **Resident rules.** The Buffer form keeps the rules of "Resident products". A, B and C must be
+  distinct buffers, and C is provisional until `wait`. A second product writing the same C buffer
+  in one batch is therefore still rejected. Recursion that writes several blocks of one matrix
+  needs one batch per dependent write, or the host-array form.
+
+**Block utilities.** `negate_block`, `copy_block` (optionally transposing and/or negating) and
+`axpy_block` (`Y = RN(Y + alpha X)`, one rounding per entry, as `fma`) work on strided host blocks
+over the Linalg's worker threads. Negation and copies are exact.
+
+`tests/test_gemm_spec.cpp` checks the following against MPFR dots at 256 and 1152 bits:
+
+- every transpose, update and triangle combination on offset views;
+- the GPU, forced-host and resident paths, with placement checked to mix GPU, multi-band and
+  fallback outputs;
+- untouched entries, compared bit for bit;
+- `syr2k` (both forms, symmetric and skew) and the utilities.
+
 ### Workspace release
 
 ```cpp

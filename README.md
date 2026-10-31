@@ -82,6 +82,10 @@ measurements.
 - **Unreleased:** synchronous `Linalg::gemm_gpu` requires Metal execution for every nontrivial
   exact dot product, rejecting host fallback before submitting commands or modifying C.
   Zero/status outputs may still be assembled on the host; ordinary `gemm` retains its fallback.
+- **Unreleased:** `Linalg::gemm` with a `GemmSpec`: submatrix views (offsets and leading dimensions) on host
+  arrays and Buffers, `transpose_b`, overwrite/add/subtract and lower- or upper-only output. Adds a
+  one-rounding symmetric/skew `syr2k` and multithreaded host `negate_block`/`copy_block`/`axpy_block`; see
+  [strided, signed and triangular products](docs/numerics.md#strided-signed-and-triangular-products).
 - Real and complex Householder QR, optional column pivoting, reusable least-squares factors,
   multiple-right-hand-side solves and Q application (`linalg.hpp`). QR uses host panels
   and GPU/host updates; see [QR contracts](docs/numerics.md#qr-factorization-and-least-squares).

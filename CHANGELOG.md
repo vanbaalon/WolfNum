@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Add strided, signed and triangular products (`LIMBFORGE_GEMM_SPEC_API`): `Linalg::gemm` with a
+  `GemmSpec` (leading dimensions and offsets on host arrays and resident Buffers, `transpose_b`,
+  overwrite/add/subtract, lower/upper-only output). Add `Linalg::syr2k` for the symmetric and skew
+  rank-2k updates with one rounding per entry, and multithreaded exact `negate_block`/`copy_block`
+  and one-rounding `axpy_block`. Existing entry points, defaults and rounding are unchanged;
+  internally, strided host views not in a resident buffer are now packed rather than rejected.
+  Validation: `tests/test_gemm_spec.cpp` (new) against MPFR at 256/1152 bits on GPU, forced-host
+  and resident paths. Existing `linalg_gpu`, `gpu_required_gemm`, resident (`--quick`), Cholesky
+  and QR tests pass.
+
 - Refresh the README for the renamed GitHub repository, distinguish the v1.3.1
   release from unreleased 2048-bit/preflight/GPU-required GEMM features, and document
   existing QR, storage, source-sharing and workspace APIs. Correct stale scope and
