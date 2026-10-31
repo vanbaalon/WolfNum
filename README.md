@@ -111,6 +111,8 @@ measurements.
 - Typed resident buffers, asynchronous submissions, and dependent operations in one command batch, including
   polynomials, norms, transcendental functions and dense `syrk`/`gemm` (`docs/execution.md`, "Resident units").
 - In-place pointwise arithmetic, cached pipelines, and explicit buffer ownership checks.
+- **Unreleased:** broadcast reads of every element-wise operand (kernel matrices from row/column vectors)
+  and a batched block-diagonal congruence `T M T^T`; see [block-diagonal congruence](docs/numerics.md#block-diagonal-congruence).
 - Algebra prewarming (synchronous/asynchronous), reusable product/normal-equation workspaces,
   workspace accounting/release, and explicit exact/sequential contract aliases (since 1.2.0).
 - Fixed-order real and complex tree reductions with GPU-resident intermediate levels.

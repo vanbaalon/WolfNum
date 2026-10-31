@@ -27,7 +27,7 @@ void validate(int bits,std::size_t count) {
     if(bits<64||bits>2048||bits%32)throw std::invalid_argument("bits must be a multiple of 32 in [64,2048]");
     if(count>std::numeric_limits<std::uint32_t>::max())throw std::invalid_argument("batch exceeds 32-bit indexing");
 }
-struct Params {std::uint32_t count,operation,steps,weight_count,states_per_weight,b_stride,b_period,c_stride,c_period;};
+struct Params {std::uint32_t count,operation,steps,weight_count,states_per_weight,b_stride,b_period,c_stride,c_period,a_stride,a_period;};
 std::uint32_t index32(std::size_t x){if(x>std::numeric_limits<std::uint32_t>::max())throw std::invalid_argument("broadcast exceeds 32-bit indexing");return std::uint32_t(x);}
 }
 namespace {
@@ -104,7 +104,12 @@ struct Engine::Impl {
         @autoreleasepool {
         id<MTLLibrary> lib=library(bits);
         NSError* error=nil;id<MTLFunction> function;
-        if(operation>=500){
+        if(operation>=600){
+            MTLFunctionConstantValues* constants=[MTLFunctionConstantValues new];
+            std::uint32_t real=operation-600;[constants setConstantValue:&real type:MTLDataTypeUInt atIndex:5];
+            function=[lib newFunctionWithName:@"congruence" constantValues:constants error:&error];
+        }
+        else if(operation>=500){
             function=[lib newFunctionWithName:operation==501?@"cast_complex":@"cast_real"];
         }
         else if(operation>=400){
@@ -253,7 +258,8 @@ struct Engine::Impl {
         }
     }
     Timing dispatch(int bits,int operation,const void* a,std::size_t a_bytes,const void* b,std::size_t b_bytes,
-                    void* out,std::size_t out_bytes,std::size_t count,unsigned steps,unsigned states_per_weight=1,const void* c=nullptr,std::size_t c_bytes=0,unsigned threads_per_item=1,Broadcast b_index={},Broadcast c_index={}) {
+                    void* out,std::size_t out_bytes,std::size_t count,unsigned steps,unsigned states_per_weight=1,const void* c=nullptr,std::size_t c_bytes=0,unsigned threads_per_item=1,Broadcast b_index={},Broadcast c_index={},
+                    Broadcast a_index={1,0}) {
         @autoreleasepool {
             // Compilation is deliberately excluded from timings; cached per precision/operation.
             auto state=pipeline(bits,operation);
@@ -267,7 +273,7 @@ struct Engine::Impl {
             [encoder setComputePipelineState:state];
             for(unsigned i=0;i<3;++i)[encoder setBuffer:buffers[i==1&&!b_bytes?0:i] offset:0 atIndex:i];
             Params params={std::uint32_t(count),std::uint32_t(operation),steps,std::uint32_t(count/states_per_weight),states_per_weight,
-                           index32(b_index.stride),index32(b_index.period),index32(c_index.stride),index32(c_index.period)};
+                           index32(b_index.stride),index32(b_index.period),index32(c_index.stride),index32(c_index.period),index32(a_index.stride),index32(a_index.period)};
             [encoder setBytes:&params length:sizeof(params) atIndex:3];
             if(c_bytes)[encoder setBuffer:buffers[3] offset:0 atIndex:4];
             NSUInteger group=group_size(state,bits,operation);
@@ -331,7 +337,7 @@ CommandBatch::~CommandBatch()=default;
 CommandBatch::CommandBatch(CommandBatch&&)noexcept=default;
 CommandBatch& CommandBatch::operator=(CommandBatch&&)noexcept=default;
 void CommandBatch::encode(int bits,bool complex,Operation op,const std::shared_ptr<detail::BufferStorage>& a,const std::shared_ptr<detail::BufferStorage>& b,
-                         const std::shared_ptr<detail::BufferStorage>& c,const std::shared_ptr<detail::BufferStorage>& out,std::size_t count,Broadcast b_index,Broadcast c_index){
+                         const std::shared_ptr<detail::BufferStorage>& c,const std::shared_ptr<detail::BufferStorage>& out,std::size_t count,Broadcast b_index,Broadcast c_index,Broadcast a_index){
     if(!impl_||impl_->submitted)throw std::logic_error("batch already submitted or moved");
     validate(bits,count);int operation=int(op);
     if(!operation_is_valid(op)||operation_is_complex(op)!=complex)throw std::invalid_argument("operation and buffer format mismatch");
@@ -340,7 +346,8 @@ void CommandBatch::encode(int bits,bool complex,Operation op,const std::shared_p
     auto encoder=impl_->compute();[encoder setComputePipelineState:state];
     [encoder setBuffer:a->buffer offset:0 atIndex:0];[encoder setBuffer:b->buffer offset:0 atIndex:1];[encoder setBuffer:out->buffer offset:0 atIndex:2];
     if(operation_is_ternary(op))[encoder setBuffer:c->buffer offset:0 atIndex:4];
-    Params params={std::uint32_t(count),std::uint32_t(operation),0,std::uint32_t(count),1,index32(b_index.stride),index32(b_index.period),index32(c_index.stride),index32(c_index.period)};
+    Params params={std::uint32_t(count),std::uint32_t(operation),0,std::uint32_t(count),1,index32(b_index.stride),index32(b_index.period),index32(c_index.stride),index32(c_index.period),
+                   index32(a_index.stride),index32(a_index.period)};
     [encoder setBytes:&params length:sizeof(params) atIndex:3];
     NSUInteger group=impl_->engine->group_size(state,bits,operation);
     [encoder dispatchThreads:MTLSizeMake(count,1,1) threadsPerThreadgroup:MTLSizeMake(group,1,1)];
@@ -372,6 +379,26 @@ void CommandBatch::encode_lu4(int bits,const Batched4& s,const std::shared_ptr<d
     const unsigned slot[5]={0,1,2,4,5};for(int i=0;i<5;++i)[encoder setBuffer:(in[i]&&n[i]?in[i]:in[0])->buffer offset:0 atIndex:slot[i]];
     std::uint32_t params[2]={std::uint32_t(s.count),s.rhs};[encoder setBytes:params length:sizeof(params) atIndex:3];
     [encoder dispatchThreads:MTLSizeMake(s.count,1,1) threadsPerThreadgroup:MTLSizeMake(impl_->engine->group_size(state,bits,operation),1,1)];
+}
+void CommandBatch::encode_congruence(int bits,const Congruence& c,const std::shared_ptr<detail::BufferStorage>& T,std::size_t t_size,const std::shared_ptr<detail::BufferStorage>& M,
+                                     std::size_t m_size,const std::shared_ptr<detail::BufferStorage>& N,std::size_t n_size){
+    if(!impl_||impl_->submitted)throw std::logic_error("batch already submitted or moved");
+    validate(bits,c.n);
+    if(!c.block||c.block>64||c.n%c.block)throw std::invalid_argument("congruence: block must divide n and be at most 64");
+    if(c.triangle<0||c.triangle>2)throw std::invalid_argument("congruence: triangle is 0, 1 (lower) or 2 (upper)");
+    const std::size_t ldm=c.ld_m?c.ld_m:c.n,ldn=c.ld_n?c.ld_n:c.n;
+    if(ldm<c.n||ldn<c.n)throw std::invalid_argument("congruence: leading dimension below n");
+    if(c.n&&(t_size<c.n*c.block||m_size<(c.n-1)*ldm+c.n||n_size<(c.n-1)*ldn+c.n))throw std::invalid_argument("congruence: buffer too small");
+    if(N==T||N==M)throw std::invalid_argument("congruence: N must not alias T or M");
+    impl_->retain(T);impl_->retain(M);impl_->retain(N,true);if(!c.n)return;
+    const int operation=600+(c.real_output?1:0);auto state=impl_->engine->pipeline(bits,operation);
+    auto encoder=impl_->compute();[encoder setComputePipelineState:state];
+    [encoder setBuffer:T->buffer offset:0 atIndex:0];[encoder setBuffer:M->buffer offset:0 atIndex:1];
+    [encoder setBuffer:(c.real_output?T:N)->buffer offset:0 atIndex:2];[encoder setBuffer:(c.real_output?N:T)->buffer offset:0 atIndex:4];
+    const std::uint32_t params[6]={index32(c.n),index32(c.block),index32(ldm),index32(ldn),std::uint32_t(c.triangle),c.strict};
+    [encoder setBytes:params length:sizeof(params) atIndex:3];
+    const NSUInteger w=state.threadExecutionWidth,h=std::max<NSUInteger>(1,std::min<NSUInteger>(8,state.maxTotalThreadsPerThreadgroup/w));
+    [encoder dispatchThreads:MTLSizeMake(c.n,c.n,1) threadsPerThreadgroup:MTLSizeMake(w,h,1)];
 }
 void CommandBatch::encode_cast(int from,int to,bool complex,const std::shared_ptr<detail::BufferStorage>& in,const std::shared_ptr<detail::BufferStorage>& out,std::size_t count){
     if(!impl_||impl_->submitted)throw std::logic_error("batch already submitted or moved");
@@ -488,6 +515,24 @@ Timing Engine::run(int bits,Operation op,const void* a,const void* b,void* out,s
     std::size_t b_bytes=operation_is_unary(op)?0:checked_size(broadcast_elements(count,b_index),stride);
     return impl->dispatch(bits,operation,a,bytes,operation_is_unary(op)?a:b,b_bytes,out,bytes,count,0,1,nullptr,0,1,b_index);
 }
+Timing Engine::run(int bits,Operation op,const void* a,const void* b,void* out,std::size_t count,Broadcast a_index,Broadcast b_index){
+    validate(bits,count);int operation=int(op);
+    if(!operation_is_valid(op))throw std::invalid_argument("unknown arithmetic operation");
+    if(operation_is_ternary(op))throw std::invalid_argument("use run_ternary for fused operations");
+    if(!count)return {0,0};
+    if(!a||(!b&&!operation_is_unary(op))||!out)throw std::invalid_argument("null arithmetic buffer");
+    std::size_t stride=(bits/8+12)*(operation_is_complex(op)?2:1),bytes=checked_size(count,stride),a_bytes=checked_size(broadcast_elements(count,a_index),stride);
+    std::size_t b_bytes=operation_is_unary(op)?0:checked_size(broadcast_elements(count,b_index),stride);
+    return impl->dispatch(bits,operation,a,a_bytes,operation_is_unary(op)?a:b,b_bytes,out,bytes,count,0,1,nullptr,0,1,b_index,{},a_index);
+}
+Timing Engine::run_ternary(int bits,Operation op,const void* a,const void* b,const void* c,void* out,std::size_t count,Broadcast a_index,Broadcast b_index,Broadcast c_index){
+    validate(bits,count);if(!operation_is_ternary(op))throw std::invalid_argument("operation does not take three inputs");
+    if(!count)return {0,0};
+    if(!a||!b||!c||!out)throw std::invalid_argument("null arithmetic buffer");
+    std::size_t stride=(bits/8+12)*(operation_is_complex(op)?2:1),bytes=checked_size(count,stride);
+    return impl->dispatch(bits,int(op),a,checked_size(broadcast_elements(count,a_index),stride),b,checked_size(broadcast_elements(count,b_index),stride),out,bytes,count,0,1,
+                          c,checked_size(broadcast_elements(count,c_index),stride),1,b_index,c_index,a_index);
+}
 Timing Engine::run_unary(int bits,Operation op,const void* a,void* out,std::size_t count){
     if(!operation_is_unary(op))throw std::invalid_argument("operation requires two inputs");
     return run(bits,op,a,nullptr,out,count);
@@ -520,6 +565,15 @@ Timing Engine::lu4(int bits,const Batched4& s,const void* A,const void* B,void* 
     std::size_t stride=2*(bits/8+12);
     return impl->lu4_dispatch(bits,400+int(lu4_flags(s)),s,A,checked_size(s.count*16,stride),B,checked_size(checked_size(s.count*4,s.rhs),stride),
                               X,checked_size(checked_size(s.count*4,R),stride),det,s.determinant?checked_size(s.count,stride):0,status);
+}
+Timing Engine::congruence(int bits,const Congruence& c,const void* T,const void* M,void* N){
+    validate(bits,c.n);if(!c.n)return {0,0};if(!T||!M||!N)throw std::invalid_argument("null congruence array");
+    const std::size_t e=bits/8+12,ldm=c.ld_m?c.ld_m:c.n,ldn=c.ld_n?c.ld_n:c.n,out_e=c.real_output?e:2*e;
+    const std::size_t tb=checked_size(c.n*c.block,2*e),mb=checked_size((c.n-1)*ldm+c.n,2*e),nb=checked_size((c.n-1)*ldn+c.n,out_e);
+    auto t=allocate(tb),m=allocate(mb),o=allocate(nb);
+    std::memcpy(t->buffer.contents,T,tb);std::memcpy(m->buffer.contents,M,mb);std::memcpy(o->buffer.contents,N,nb);  // untouched N entries pass through
+    auto b=batch();b.encode_congruence(bits,c,t,c.n*c.block,m,(c.n-1)*ldm+c.n,o,(c.n-1)*ldn+c.n);Timing tm=b.submit().wait();
+    std::memcpy(N,o->buffer.contents,nb);return tm;
 }
 void Engine::prewarm(const Prewarm& r){impl->prewarm(r);}
 std::future<void> Engine::prewarm_async(Prewarm r){auto keep=impl;return std::async(std::launch::async,[keep,r=std::move(r)]{keep->prewarm(r);});}

@@ -8,6 +8,8 @@
 #include <vector>
 #include <stdexcept>
 #define LIMBFORGE_RESIDENT_API 1
+#define LIMBFORGE_BROADCAST_A_API 1
+#define LIMBFORGE_CONGRUENCE_API 1
 namespace limbforge {
 // fma/fms: RN(a*b +/- c); complex_fma/complex_fms: each component one rounding of its exact value.
 enum class Operation { add, sub, mul, div, complex_add, complex_mul, complex_div, square, sqrt, fma, fms, complex_fma, complex_fms };
@@ -36,6 +38,14 @@ struct SegmentedDot { std::size_t segments=0,length=0; bool shared_right=false; 
 // B and X are [count][4][rhs] (inverse: X is [count][4][4] and B is unused); det is [count];
 // status[i] is 0, or k+1 when column k had a zero pivot (X then carries division_by_zero).
 struct Batched4 { std::size_t count=0; unsigned rhs=0; bool inverse=false,determinant=false,fused=false; };
+// Batched block-diagonal congruence N = T M T^T (unreleased; LIMBFORGE_CONGRUENCE_API; docs/numerics.md, "Block-diagonal
+// congruence"). M: n x n complex, row-major with leading dimension ld_m (0: n). T = blockdiag(T_0, ..., T_{n/block-1}), b x b complex
+// blocks stored [n/b][b][b] row-major (n a multiple of b, b <= 64). Output entry (i, j) in block pair (p, q):
+// t_l = sum_k T_p[i][k] M[pb+k][qb+l], N_ij = sum_l t_l T_q[j][l], each sum by cfma in ascending index (one rounding per component
+// per step). real_output: N is a real matrix receiving Re N_ij; otherwise complex. triangle 1 / 2 writes only i >= j / i <= j
+// (strict: i > j / i < j) and reads only the M blocks it needs (block pairs p >= q / p <= q); other N entries are untouched.
+// ld_n: leading dimension of N (0: n).
+struct Congruence { std::size_t n=0,block=4,ld_m=0,ld_n=0; bool real_output=false; int triangle=0; bool strict=false; };
 // Shape and options of Engine::vector_recurrence (docs/numerics.md, "Vector recurrences").
 // Complex arrays are component-major: element j of lane i is at [j*lanes + i].
 struct VectorRecurrence {
@@ -107,10 +117,12 @@ class CommandBatch {
     struct Impl;std::unique_ptr<Impl> impl_;
     explicit CommandBatch(std::unique_ptr<Impl> impl);
     void encode(int,bool,Operation,const std::shared_ptr<detail::BufferStorage>&,const std::shared_ptr<detail::BufferStorage>&,
-                const std::shared_ptr<detail::BufferStorage>&,const std::shared_ptr<detail::BufferStorage>&,std::size_t,Broadcast={},Broadcast={});
+                const std::shared_ptr<detail::BufferStorage>&,const std::shared_ptr<detail::BufferStorage>&,std::size_t,Broadcast={},Broadcast={},Broadcast={});
     void encode_vector(int,const VectorRecurrence&,const std::shared_ptr<detail::BufferStorage>* in,const std::size_t* sizes,
                        const std::shared_ptr<detail::BufferStorage>& out,std::size_t out_size);
     void encode_lu4(int,const Batched4&,const std::shared_ptr<detail::BufferStorage>* in,const std::size_t* sizes);
+    void encode_congruence(int,const Congruence&,const std::shared_ptr<detail::BufferStorage>& T,std::size_t t_size,const std::shared_ptr<detail::BufferStorage>& M,
+                           std::size_t m_size,const std::shared_ptr<detail::BufferStorage>& N,std::size_t n_size);
     void encode_cast(int,int,bool,const std::shared_ptr<detail::BufferStorage>&,const std::shared_ptr<detail::BufferStorage>&,std::size_t);
     void encode_dot(int,bool,const SegmentedDot&,const std::shared_ptr<detail::BufferStorage>&,std::size_t,const std::shared_ptr<detail::BufferStorage>&,std::size_t,
                     const std::shared_ptr<detail::BufferStorage>&,std::size_t);
@@ -135,6 +147,20 @@ public:
         if(!operation_is_ternary(op))throw std::invalid_argument("operation does not take three inputs");
         if(a.size()!=out.size()||b.size()<broadcast_elements(a.size(),b_index)||c.size()<broadcast_elements(a.size(),c_index))throw std::invalid_argument("buffer counts do not match the broadcast");
         encode(detail::Format<T>::bits,detail::Format<T>::complex,op,a.storage_,b.storage_,c.storage_,out.storage_,a.size(),b_index,c_index);
+    }
+    // Broadcast a as well (unreleased; LIMBFORGE_BROADCAST_A_API): element i of out reads a, b (and c) through their own indices,
+    // e.g. a_index {n, 0} and b_index {1, n} give out[i*n + j] = a[i] op b[j]. out has the element count; a broadcast operand
+    // must not alias out.
+    template<class T> void run(Operation op,const Buffer<T>& a,const Buffer<T>& b,Buffer<T>& out,Broadcast a_index,Broadcast b_index){
+        if(operation_is_unary(op)||operation_is_ternary(op))throw std::invalid_argument("operation requires a different number of inputs");
+        if(a.size()<broadcast_elements(out.size(),a_index)||b.size()<broadcast_elements(out.size(),b_index))throw std::invalid_argument("buffer counts do not match the broadcast");
+        encode(detail::Format<T>::bits,detail::Format<T>::complex,op,a.storage_,b.storage_,a.storage_,out.storage_,out.size(),b_index,{},a_index);
+    }
+    template<class T> void run(Operation op,const Buffer<T>& a,const Buffer<T>& b,const Buffer<T>& c,Buffer<T>& out,Broadcast a_index,Broadcast b_index,Broadcast c_index){
+        if(!operation_is_ternary(op))throw std::invalid_argument("operation does not take three inputs");
+        if(a.size()<broadcast_elements(out.size(),a_index)||b.size()<broadcast_elements(out.size(),b_index)||c.size()<broadcast_elements(out.size(),c_index))
+            throw std::invalid_argument("buffer counts do not match the broadcast");
+        encode(detail::Format<T>::bits,detail::Format<T>::complex,op,a.storage_,b.storage_,c.storage_,out.storage_,out.size(),b_index,c_index,a_index);
     }
     // fma/fms/complex_fma/complex_fms: out = a*b +/- c. Any operand may alias out.
     template<class T> void run(Operation op,const Buffer<T>& a,const Buffer<T>& b,const Buffer<T>& c,Buffer<T>& out){
@@ -161,6 +187,13 @@ public:
         const std::shared_ptr<detail::BufferStorage> in[7]={start.storage_,p.storage_,q.storage_,r.storage_,base.storage_,dp.storage_,dq.storage_};
         const std::size_t sizes[7]={start.size(),p.size(),q.size(),r.size(),base.size(),dp.size(),dq.size()};
         encode_vector(detail::Format<T>::bits,shape,in,sizes,out.storage_,out.size());
+    }
+    // Resident Engine::congruence: T and M complex; N complex, or real (Float of the same width) with real_output. N must not alias T or M.
+    template<class C,class O> void congruence(const Congruence& shape,const Buffer<C>& T,const Buffer<C>& M,Buffer<O>& N){
+        static_assert(detail::Format<C>::complex,"congruence: T and M are complex buffers");
+        static_assert(detail::Format<O>::bits==detail::Format<C>::bits,"congruence: N has the width of T and M");
+        if(detail::Format<O>::complex==shape.real_output)throw std::invalid_argument("congruence: N must be real exactly when real_output is set");
+        encode_congruence(detail::Format<C>::bits,shape,T.storage_,T.size(),M.storage_,M.size(),N.storage_,N.size());
     }
     // Resident Engine::lu4: unused buffers (B for an inverse, det without determinant) may be empty.
     template<class T> void lu4(const Batched4& shape,const Buffer<T>& A,const Buffer<T>& B,Buffer<T>& X,Buffer<T>& det,Buffer<std::uint32_t>& status){
@@ -205,10 +238,16 @@ public:
     Timing run(int bits,Operation op,const void* a,const void* b,void* out,std::size_t count,Broadcast b_index={});
     Timing run_unary(int bits,Operation op,const void* a,void* out,std::size_t count);
     Timing run_ternary(int bits,Operation op,const void* a,const void* b,const void* c,void* out,std::size_t count,Broadcast b_index={},Broadcast c_index={});
+    // Broadcast a as well: a holds broadcast_elements(count, a_index) values (see CommandBatch::run with a_index).
+    Timing run(int bits,Operation op,const void* a,const void* b,void* out,std::size_t count,Broadcast a_index,Broadcast b_index);
+    Timing run_ternary(int bits,Operation op,const void* a,const void* b,const void* c,void* out,std::size_t count,Broadcast a_index,Broadcast b_index,Broadcast c_index);
     Timing segmented_dot(int bits,bool complex,const SegmentedDot& shape,const void* a,const void* b,void* out);
     // Host-array precision cast between any two supported widths (complex: componentwise).
     Timing cast(int from_bits,int to_bits,bool complex,const void* in,void* out,std::size_t count);
     Timing lu4(int bits,const Batched4& shape,const void* A,const void* B,void* X,void* det,std::uint32_t* status);
+    // Host-array form of CommandBatch::congruence (T, M: Complex<bits/32>; N: Complex, or Float<bits> with real_output). The arrays
+    // are staged through engine buffers; N entries outside the triangle are copied through unchanged.
+    Timing congruence(int bits,const Congruence& shape,const void* T,const void* M,void* N);
     // Four seeds / instance. Adjacent states_per_weight instances share weights;
     // count must be divisible by states_per_weight. Layout is seeds[j*count+i],
     // weights[(step*4+j)*(count/states_per_weight)+i/states_per_weight].

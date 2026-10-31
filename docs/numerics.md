@@ -154,7 +154,45 @@ element `i` uses index `(i / stride) % period` (`period = 0`: no wrap). `stride 
 across `k` adjacent outputs; `period = m` cycles a table of `m` values. The operand then holds
 `broadcast_elements(count, broadcast)` values. Available as `Engine::run(…, b_index)`,
 `Engine::run_ternary(…, b_index, c_index)` and the matching `CommandBatch::run` overloads; rounding is
-unchanged. The `a` operand and the output keep one element per index.
+unchanged.
+
+**Broadcast `a`.** Unreleased, feature macro `LIMBFORGE_BROADCAST_A_API`. The overloads
+`Engine::run(…, a_index, b_index)`, `Engine::run_ternary(…, a_index, b_index, c_index)` and the
+matching `CommandBatch::run` forms read `a` through its own index too. The output count is the
+element count.
+
+Row and column broadcasts build kernel matrices without full-size operands: `a_index = {n, 0}` and
+`b_index = {1, n}` give `out[i*n + j] = a[i] op b[j]`, and a fused `c_index = {1, n}` adds `c[j]`. A
+broadcast operand must not alias the output. Without `a_index`, `a` keeps one element per index as
+before.
+
+## Block-diagonal congruence
+
+`Engine::congruence(bits, shape, T, M, N)` and `CommandBatch::congruence(shape, T, M, N)` (unreleased;
+`LIMBFORGE_CONGRUENCE_API`) form `N = T M T^T`.
+
+- **Operands.** `M` is an `n x n` complex matrix (`ld_m`). `T = blockdiag(T_0, ..., T_{n/b-1})` has
+  complex `b x b` blocks stored `[n/b][b][b]`, with `b` dividing `n` and `b <= 64`. This is the
+  transform that makes a matrix with conjugate-pair structure real.
+- **Sequence.** Output `(i, j)` in block pair `(p, q)` takes `t_l = sum_k T_p[i][k] M[pb+k][qb+l]`, then
+  `N_ij = sum_l t_l T_q[j][l]`. Both sums are `cfma` chains in ascending index, one rounding per
+  component per step: the batched complex GEMM's fused sequence, applied twice. One GPU thread
+  computes each output, O(n^2 b) in total.
+- **Output.** `real_output` writes `Re N` to a real `Float<bits>` matrix; otherwise `N` is complex
+  (`ld_n`). `triangle = 1` or `2` writes only `i >= j` or `i <= j` (`strict`: `i > j` or `i < j`). It
+  reads only the `M` blocks it needs (block pairs `p >= q` or `p <= q`), so a skew `M` needs only
+  its lower block triangle and diagonal blocks filled. Other `N` entries are untouched.
+- **Forms.** The resident form is the main path: an `M` assembled on the GPU (for example with the
+  broadcast operands above and `gemm_complex`) never returns to the host. The host form stages
+  through engine buffers.
+
+**Measured** (192 bits, `b = 4`, real strict-lower output, resident, loaded M5 Max host): n = 2048 takes
+0.20 s GPU time.
+
+**Validation.** `tests/test_congruence.cpp` checks every combination of block size (1, 3, 4), output kind,
+triangle and strictness, with leading dimensions and untouched entries. It runs host and resident
+forms at 192, 256 and 1152 bits, bit for bit against MPFR (`reference::complex_fused` chains).
+`tests/test_broadcast.cpp` covers the broadcast `a` kernel matrices.
 
 ## Batched 4×4 systems
 

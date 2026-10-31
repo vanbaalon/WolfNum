@@ -2,7 +2,7 @@ using namespace metal;
 using namespace limbforge;
 constant int N=MP_BITS/32;
 constant uint selected_operation [[function_constant(0)]];
-struct Params { uint count,operation,steps,weight_count,states_per_weight,b_stride,b_period,c_stride,c_period; };
+struct Params { uint count,operation,steps,weight_count,states_per_weight,b_stride,b_period,c_stride,c_period,a_stride,a_period; };
 // Broadcast operand index (i / stride) % period; stride 0/1 and period 0 leave i unchanged.
 inline uint operand(uint i,uint stride,uint period){uint j=stride>1?i/stride:i;return period?j%period:j;}
 kernel void arithmetic(device const Number<N>* a [[buffer(0)]],
@@ -10,7 +10,7 @@ kernel void arithmetic(device const Number<N>* a [[buffer(0)]],
                        device Number<N>* out [[buffer(2)]],
                        constant Params& p [[buffer(3)]],uint i [[thread_position_in_grid]]) {
     if(i>=p.count)return;
-    Number<N> x=a[i],z;
+    Number<N> x=a[operand(i,p.a_stride,p.a_period)],z;
     if(selected_operation==7)z=square(x);
     else if(selected_operation==8)z=limbforge::sqrt(x);
     else {Number<N> y=b[operand(i,p.b_stride,p.b_period)];switch(selected_operation){case 0:z=add(x,y);break;case 1:z=sub(x,y);break;case 2:z=mul(x,y);break;default:z=div(x,y);}}
@@ -21,7 +21,7 @@ kernel void complex_arithmetic(device const Complex<N>* a [[buffer(0)]],
                                device Complex<N>* out [[buffer(2)]],
                                constant Params& p [[buffer(3)]],uint i [[thread_position_in_grid]]) {
     if(i>=p.count)return;
-    Complex<N> x=a[i],y=b[operand(i,p.b_stride,p.b_period)],z;
+    Complex<N> x=a[operand(i,p.a_stride,p.a_period)],y=b[operand(i,p.b_stride,p.b_period)],z;
     switch(selected_operation){case 4:z=cadd(x,y);break;case 5:z=cmul(x,y);break;default:z=cdiv(x,y);}
     out[i]=z;
 }
@@ -29,12 +29,12 @@ kernel void complex_arithmetic(device const Complex<N>* a [[buffer(0)]],
 kernel void fused_arithmetic(device const Number<N>* a [[buffer(0)]],device const Number<N>* b [[buffer(1)]],device Number<N>* out [[buffer(2)]],
                              constant Params& p [[buffer(3)]],device const Number<N>* c [[buffer(4)]],uint i [[thread_position_in_grid]]) {
     if(i>=p.count)return;
-    Number<N> x=a[i],y=b[operand(i,p.b_stride,p.b_period)],z=c[operand(i,p.c_stride,p.c_period)];out[i]=selected_operation==10?limbforge::fms(x,y,z):limbforge::fma(x,y,z);
+    Number<N> x=a[operand(i,p.a_stride,p.a_period)],y=b[operand(i,p.b_stride,p.b_period)],z=c[operand(i,p.c_stride,p.c_period)];out[i]=selected_operation==10?limbforge::fms(x,y,z):limbforge::fma(x,y,z);
 }
 kernel void complex_fused(device const Complex<N>* a [[buffer(0)]],device const Complex<N>* b [[buffer(1)]],device Complex<N>* out [[buffer(2)]],
                           constant Params& p [[buffer(3)]],device const Complex<N>* c [[buffer(4)]],uint i [[thread_position_in_grid]]) {
     if(i>=p.count)return;
-    Complex<N> x=a[i],y=b[operand(i,p.b_stride,p.b_period)],z=c[operand(i,p.c_stride,p.c_period)];out[i]=selected_operation==12?cfms(x,y,z):cfma(x,y,z);
+    Complex<N> x=a[operand(i,p.a_stride,p.a_period)],y=b[operand(i,p.b_stride,p.b_period)],z=c[operand(i,p.c_stride,p.c_period)];out[i]=selected_operation==12?cfms(x,y,z):cfma(x,y,z);
 }
 kernel void recurrence(device const Complex<N>* seeds [[buffer(0)]],
                        device const Complex<N>* weights [[buffer(1)]],
@@ -264,4 +264,22 @@ kernel void cast_real(device const uint* in [[buffer(0)]],device Number<N>* out 
 }
 kernel void cast_complex(device const uint* in [[buffer(0)]],device Complex<N>* out [[buffer(2)]],constant CastParams& p [[buffer(3)]],uint i [[thread_position_in_grid]]){
     if(i>=p.count)return;ulong w=p.from_words+3;Complex<N> z={cast_number(in+ulong(i)*2*w,p.from_words),cast_number(in+ulong(i)*2*w+w,p.from_words)};out[i]=z;
+}
+
+// Batched block-diagonal congruence N = T M T^T (Engine::congruence): output (i, j) in block pair (p, q) takes t_l = sum_k T_p[i][k]
+// M[pb+k][qb+l] and N_ij = sum_l t_l T_q[j][l], each sum by cfma in ascending index (one rounding per component per step).
+// cg_real: only Re N, to a real matrix (buffer 4); otherwise complex N (buffer 2).
+struct CongruenceParams { uint n,b,ld_m,ld_n,tri,strict; };
+constant uint cg_real [[function_constant(5)]];
+kernel void congruence(device const Complex<N>* T [[buffer(0)]],device const Complex<N>* M [[buffer(1)]],device Complex<N>* out [[buffer(2)]],
+                       constant CongruenceParams& p [[buffer(3)]],device Number<N>* out_real [[buffer(4)]],uint2 g [[thread_position_in_grid]]){
+    const uint j=g.x,i=g.y;if(i>=p.n||j>=p.n)return;
+    if((p.tri==1&&(p.strict?i<=j:i<j))||(p.tri==2&&(p.strict?i>=j:i>j)))return;
+    const uint b=p.b,P=i/b,Q=j/b;device const Complex<N>* Tp=T+(ulong(P)*b+i%b)*b;device const Complex<N>* Tq=T+(ulong(Q)*b+j%b)*b;
+    device const Complex<N>* Mb=M+ulong(P*b)*p.ld_m+Q*b;
+    Complex<N> acc={zero<N>(),zero<N>()};
+    for(uint l=0;l<b;++l){Complex<N> t={zero<N>(),zero<N>()};
+        for(uint k=0;k<b;++k)t=cfma(Tp[k],Mb[ulong(k)*p.ld_m+l],t);
+        acc=cfma(t,Tq[l],acc);}
+    if(cg_real)out_real[ulong(i)*p.ld_n+j]=acc.re;else out[ulong(i)*p.ld_n+j]=acc;
 }

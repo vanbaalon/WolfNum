@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add broadcast reads of operand `a` (`LIMBFORGE_BROADCAST_A_API`: `Engine::run`/`run_ternary` and
+  `CommandBatch::run` overloads with `a_index`), so kernel matrices f(x_i, y_j) build on the GPU from
+  row and column vectors. Add the batched block-diagonal congruence `N = T M T^T`
+  (`Engine::congruence`, `CommandBatch::congruence`, `LIMBFORGE_CONGRUENCE_API`): b x b complex
+  blocks, two cfma chains per output, complex or real-part output, optional (strict) triangles.
+  Validation: `tests/test_broadcast.cpp` (extended) and `tests/test_congruence.cpp` (new) against
+  MPFR, host and resident; existing element-wise kernels are unchanged (fused and resident-unit
+  suites pass).
+
 - Add opt-in two-level blocking for LU (`EliminationOptions::inner_block`). Lazy panel dots span an
   inner block, and its terms are flushed as exact products; the trailing GPU update keeps the full
   block (complex LU, 192 bits, n = 2048: 3.65 s to 3.12 s). The Pfaffian rejects it. Add the

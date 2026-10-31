@@ -25,6 +25,21 @@ template<int Bits> void run(Engine& e){
         {auto batch=e.batch();batch.run(Operation::complex_fms,X,Y,Z,R,bb,cb);batch.submit().wait();}R.download(cout.data(),n);
         for(std::size_t i=0;i<n;++i)require(reference::equal_complex<Bits>(cout[i],reference::complex_fused<Bits>(x[i],y[at(i,bb)],z[at(i,cb)],true)),"resident broadcast complex_fms bits="+std::to_string(Bits));
     }
+    // Broadcast a (G1): kernel matrices out[i*cols + j] = a[i] op b[j] (a_index {cols, 0}, b_index {1, cols}) and a[i] b[j] + c[j], host and resident.
+    {const std::size_t rows=37,cols=29,cnt=rows*cols;const Broadcast ra{cols,0},cb{1,cols};std::vector<F> a(rows),b(cols),c(cols),out(cnt),res(cnt);
+        for(auto& v:a)v=reference::random_number<Bits>(rng,9);for(auto& v:b)v=reference::random_number<Bits>(rng,9);for(auto& v:c)v=reference::random_number<Bits>(rng,9);
+        e.run(Bits,Operation::sub,a.data(),b.data(),out.data(),cnt,ra,cb);
+        for(std::size_t i=0;i<cnt;++i)require(reference::equal<Bits>(out[i],reference::real<Bits>(Operation::sub,a[i/cols],b[i%cols])),"broadcast-a sub bits="+std::to_string(Bits));
+        e.run_ternary(Bits,Operation::fma,a.data(),b.data(),c.data(),out.data(),cnt,ra,cb,cb);
+        for(std::size_t i=0;i<cnt;++i)require(reference::equal<Bits>(out[i],reference::fused<Bits>(a[i/cols],b[i%cols],c[i%cols],false)),"broadcast-a fma bits="+std::to_string(Bits));
+        auto A=e.make_buffer<F>(rows),B=e.make_buffer<F>(cols),Cc=e.make_buffer<F>(cols),O=e.make_buffer<F>(cnt),P=e.make_buffer<F>(cnt);A.upload(a.data(),rows);B.upload(b.data(),cols);Cc.upload(c.data(),cols);
+        {auto batch=e.batch();batch.run(Operation::mul,A,B,O,ra,cb);batch.run(Operation::fms,A,B,Cc,P,ra,cb,cb);batch.submit().wait();}
+        O.download(out.data(),cnt);P.download(res.data(),cnt);
+        for(std::size_t i=0;i<cnt;++i){require(reference::equal<Bits>(out[i],reference::real<Bits>(Operation::mul,a[i/cols],b[i%cols])),"resident broadcast-a mul bits="+std::to_string(Bits));
+            require(reference::equal<Bits>(res[i],reference::fused<Bits>(a[i/cols],b[i%cols],c[i%cols],true)),"resident broadcast-a fms bits="+std::to_string(Bits));}
+        std::vector<C> x(rows),y(cols),z(cnt);for(auto& v:x)v={reference::random_number<Bits>(rng,5),reference::random_number<Bits>(rng,5)};for(auto& v:y)v={reference::random_number<Bits>(rng,5),reference::random_number<Bits>(rng,5)};
+        e.run(Bits,Operation::complex_div,x.data(),y.data(),z.data(),cnt,ra,cb);
+        for(std::size_t i=0;i<cnt;++i)require(reference::equal_complex<Bits>(z[i],reference::complex<Bits>(Operation::complex_div,x[i/cols],y[i%cols])),"broadcast-a complex_div bits="+std::to_string(Bits));}
     bool rejected=false;try{auto A=e.make_buffer<F>(8),B=e.make_buffer<F>(1),O=e.make_buffer<F>(8);auto batch=e.batch();batch.run(Operation::add,A,B,O,Broadcast{4,0});}catch(const std::invalid_argument&){rejected=true;}
     require(rejected,"short broadcast operand accepted");
     std::cout<<Bits<<" bits: broadcast operands match MPFR"<<std::endl;
