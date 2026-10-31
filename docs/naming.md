@@ -31,10 +31,9 @@ with matching headers and archive as usual.
 
 ## Repository and recorded evidence
 
-The GitHub repository URL and local checkout directory retain their current names
-until the maintainer renames them. Clone commands, CI badge URLs and working paths
-therefore still reference the original repository. Update those links after the
-repository rename; API compatibility names remain independent of that change.
+The GitHub repository is now `https://github.com/vanbaalon/WolfNum`.
+Current clone commands and CI badge URLs use WolfNum; local checkout directories
+may use any name. API compatibility names remain independent of the repository rename.
 
 Published releases, raw benchmark results, metadata, calibration profile strings
 and historical experiment patches retain their original names and bytes. They

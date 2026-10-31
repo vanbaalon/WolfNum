@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Refresh the README for the renamed GitHub repository, distinguish the v1.3.1
+  release from unreleased 2048-bit/preflight/GPU-required GEMM features, and document
+  existing QR, storage, source-sharing and workspace APIs. Correct stale scope and
+  validation claims and link the recent calibration, consumer and prototype results.
+  Update current naming and release-clone guidance. Documentation validation checks
+  relative links, API names, recorded evidence and diff formatting; no numerical change.
+
 - Add `Linalg::gemm_gpu`: exact synchronous GEMM that rejects data-dependent
   host products before modifying C or submitting commands. Existing GEMM defaults
   remain unchanged. Extend the strong-coupling adapter with measured exponent-band

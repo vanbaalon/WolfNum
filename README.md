@@ -2,7 +2,7 @@
 
 **Multiprecision arithmetic on the Apple Silicon GPU.**
 
-[![CI](https://github.com/vanbaalon/LimbForge/actions/workflows/ci.yml/badge.svg)](https://github.com/vanbaalon/LimbForge/actions/workflows/ci.yml)
+[![CI](https://github.com/vanbaalon/WolfNum/actions/workflows/ci.yml/badge.svg)](https://github.com/vanbaalon/WolfNum/actions/workflows/ci.yml)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](https://en.cppreference.com/w/cpp/17)
 [![Backend: Metal](https://img.shields.io/badge/backend-Metal-555555.svg)](https://developer.apple.com/metal/)
@@ -17,14 +17,17 @@ steps of 32. Real arithmetic uses round-to-nearest, ties-to-even.
 
 Previously named LimbForge. Existing `limbforge` headers, namespace, CMake package,
 targets and configuration names remain supported for production consumers. The
-GitHub repository still uses its original URL until it is renamed.
+GitHub repository is now [vanbaalon/WolfNum](https://github.com/vanbaalon/WolfNum).
 See the [naming and compatibility notes](docs/naming.md).
 
 > **Versioned API 1.x:** the compatibility baseline is **1.0.0**; the current release is
 > **1.3.1**, releasing the WolfNum name with the existing production API.
-> Reusable polynomial-source tables and the explicit shared-source recurrence option arrived in 1.3.0.
 > Production consumers can pin `v1.3.1` and rebuild with matching headers/archive;
 > see [versioning and compatibility](docs/versioning.md).
+> This README describes **current `main`**, including unreleased 2048-bit support,
+> device/shape preflight and GPU-required GEMM. The `v1.3.1` tag supports 64–1024 bits
+> and does not include those additions. Main still carries the 1.3.1 version macros;
+> pin a commit when using unreleased features. See the [changelog](CHANGELOG.md).
 > CPU and physical GPU validation use independent MPFR operations, with device validation
 > currently covering an Apple M5 Max. See the [numerical contract](docs/numerics.md).
 
@@ -68,11 +71,23 @@ measurements.
 - Segmented real/complex dot products with a fixed, reproducible fused order and optional shared table.
 - Strided real/complex batched GEMM, device-generated power moments, matrix triple products,
   polynomial-source recurrences, and resident damping trials/solves (`batched_linalg.hpp`).
-  See [contracts, usage and audit coverage](docs/section9.md); large-workload timings are pending.
+  See [contracts, usage and audit coverage](docs/section9.md) and the measured workloads below.
+- Optional `PowerStorage::compact` power panels (since 1.1.0), reusable polynomial-source
+  tables and explicit `PolynomialEvaluation::shared_sources` recurrences (since 1.3.0).
+  Existing calls retain full-table storage and per-lane source evaluation.
 - Dense real `syrk` (AᵀA) and `gemm` with one rounding of each exact dot product (`linalg.hpp`): exact
   integer GEMMs over exponent bands on TensorOps int8 residues, with an exact host fallback; updates
   `C - op(A) B` rounded once, and a blocked Cholesky factorization with multiple-right-hand-side
   triangular solves built on them (a fixed, reproducible rounding sequence).
+- **Unreleased:** synchronous `Linalg::gemm_gpu` requires Metal execution for every nontrivial
+  exact dot product, rejecting host fallback before submitting commands or modifying C.
+  Zero/status outputs may still be assembled on the host; ordinary `gemm` retains its fallback.
+- Real and complex Householder QR, optional column pivoting, reusable least-squares factors,
+  multiple-right-hand-side solves and Q application (`linalg.hpp`). QR uses host panels
+  and GPU/host updates; see [QR contracts](docs/numerics.md#qr-factorization-and-least-squares).
+- **Unreleased:** allocation-free width/shape preflight in `capabilities.hpp`, device limits,
+  matrix-memory estimates and placement diagnostics. Structural support does not guarantee
+  available memory or GPU placement; see [wide-precision integration](docs/wide-precision.md).
 - Batched real/complex polynomial values and Taylor jets `(p, p', p''/2)` by simultaneous Horner, with
   coefficient sets shared by adjacent points and composed or fused steps (`numerics.hpp`).
 - Segmented norms (`norm_inf`, componentwise `norm_max`, exponent-scaled `norm2` on a fixed tree),
@@ -84,6 +99,8 @@ measurements.
 - Typed resident buffers, asynchronous submissions, and dependent operations in one command batch, including
   polynomials, norms, transcendental functions and dense `syrk`/`gemm` (`docs/execution.md`, "Resident units").
 - In-place pointwise arithmetic, cached pipelines, and explicit buffer ownership checks.
+- Algebra prewarming (synchronous/asynchronous), reusable product/normal-equation workspaces,
+  workspace accounting/release, and explicit exact/sequential contract aliases (since 1.2.0).
 - Fixed-order real and complex tree reductions with GPU-resident intermediate levels.
 - Configurable threadgroup sizes and per-pipeline limits for measured tuning.
 - A generic four-state complex recurrence primitive (with cooperative multi-lane execution for small batches), and a batched four-component vector recurrence (rank-one, matrix, affine, tangent and all-steps forms).
@@ -100,8 +117,8 @@ optional conversion header, tests, benchmarks, and examples.
 Use macOS 15 or newer, a Metal GPU, and Apple Command Line Tools:
 
 ```sh
-git clone https://github.com/vanbaalon/LimbForge.git
-cd LimbForge
+git clone https://github.com/vanbaalon/WolfNum.git
+cd WolfNum
 brew install cmake mpfr gmp
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
@@ -183,13 +200,20 @@ status bits. There are no NaNs, infinities, signed zeros, or subnormal encodings
 Complex arithmetic preserves rounding after each real primitive; it does not
 promise a single correctly rounded MPC complex result.
 
-Tests cover **761,856 real-operation cases across all 31 supported precisions**,
+The original arithmetic suite covers **761,856 real-operation cases across the 31
+widths from 64 through 1024 bits**,
 complex operations and recurrences, dense 65,536-value complex batches with
 repeated GPU execution, and resident-buffer ownership and lifetime checks.
-Reduction tests cover every precision, odd tails, cancellation, statuses,
+The original reduction tests cover those widths, odd tails, cancellation, statuses,
 barriers, and scratch-buffer lifetimes. One million scalar quotient/remainder
 cases validate the reciprocal used by
 division. MPFR provides independent arithmetic references.
+
+Separate wide-precision sweeps cover all **32 additional widths from 1056 through
+2048 bits** for arithmetic, exact and batched complex GEMM, real/complex QR, casts
+and tiny norms. Key widths 1056, 1152, 1536 and 2048 also pass Metal shader validation.
+The [wide-precision guide](docs/wide-precision.md#verification) records test commands
+and coverage; transcendental validation remains limited to 64–1024 bits.
 
 ## Benchmark and optimization rounds
 
@@ -214,13 +238,33 @@ batch size, and workload. [Performance measurements](docs/performance.md) includ
 raw records and limitations; the [optimization log](docs/optimizations.md) also
 records rejected experiments.
 
+Recent measurements and integration checks are recorded separately from the headline benchmark:
+
+- The [GEMM measurement grid](benchmarks/experiments/section9_gemm_extended/README.md)
+  covers 352/384/448-bit Fourier and 10,000/100,000-matrix 4×4 batches, host/resident
+  layouts and 120 offline calibration keys. These are profile-specific measurements;
+  idle-consumer timing and automatic dispatch defaults remain open.
+- The [J3 consumer sweep](benchmarks/experiments/section9_converged_sweep.md) passes
+  CPU/GPU convergence checks at g = 0.1, 0.2 and 0.5 with opt-in GPU paths and the
+  original tolerance. These fixtures establish correctness, not solver speedups.
+- The [exact batched 4×4 prototype](benchmarks/experiments/exact_gemm4/BASELINE.md)
+  passes its numerical gates but takes 1.054–4.582× composed GEMM wall time across
+  24 profiles. It remains uninstalled and does not change public APIs or defaults.
+- The [1152-bit reconstruction replay](docs/wide-precision.md#require-gpu-execution-for-reconstruction-gemms)
+  verifies GPU-required GEMM on production-sized g=100 operands with zero host
+  products and 80 sampled MPFR component checks. Its loaded-host timings cover
+  reconstruction only, not the full solver.
+
 ## Scope
 
-The current backend is Apple Metal, with fixed precision per dispatch. Further
-work includes wider device validation, cooperative SIMD arithmetic, fused
-multiply-add, and transcendental functions with explicit accuracy contracts.
-These features are not implemented. Alternate layouts have been measured as an
-experiment; the public representation remains an array of structs.
+The current backend is Apple Metal, with fixed precision per dispatch. Fused
+multiply-add, cooperative recurrence paths and certified transcendental functions
+are implemented; their contracts and validation limits are documented above.
+Further work includes validation on more devices, idle-consumer performance and
+memory measurements, and optimizations that preserve each API's rounding sequence.
+Grouped exact updates, native Gauss and exact batched 4×4 candidates remain
+experiments, with no promotion to production APIs or defaults. Alternate layouts
+have also been measured experimentally; the public representation remains an array of structs.
 GPU multiprecision has prior art; [related work](docs/prior-art.md) explains the
 context and the Metal target.
 

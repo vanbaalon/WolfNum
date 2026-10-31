@@ -35,7 +35,7 @@ numerical validation coverage and measured performance remain documented separat
 Use the immutable `v1.3.1` tag, or its commit, rather than a moving main branch:
 
 ```sh
-git clone --branch v1.3.1 --depth 1 https://github.com/vanbaalon/LimbForge.git
+git clone --branch v1.3.1 --depth 1 https://github.com/vanbaalon/WolfNum.git
 ```
 
 With an installed package, require exactly the validated release:
